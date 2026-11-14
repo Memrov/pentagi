@@ -325,6 +325,45 @@ func TestDurable_Finish_WaitsForRunningActivity(t *testing.T) {
 	assert.True(t, task.exited.Load())
 }
 
+func TestDurable_ProcessFlowInput_RecoverWaitsForRunningAttempt(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	task := &gatedTask{durableTask: durableTask{id: 9}, started: started, release: release}
+	_, runner := newDurableWorker(t, &durableTasks{tasks: []TaskWorker{task}}, &recordingEngine{}, 5, 9)
+	req := temporal.InputRequest{FlowID: reservedFlowID, Input: "scan", Recover: true, LastTaskID: 5}
+
+	first := make(chan error, 1)
+	go func() { first <- runner.ProcessFlowInput(context.Background(), req) }()
+	controllerReceive(t, started, "the timed-out attempt to start")
+
+	retry := make(chan error, 1)
+	go func() { retry <- runner.ProcessFlowInput(context.Background(), req) }()
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+
+	require.NoError(t, controllerReceive(t, first, "the timed-out attempt to return"))
+	require.NoError(t, controllerReceive(t, retry, "the retry to return"))
+	assert.Equal(t, int32(1), task.runs.Load())
+}
+
+type gatedTask struct {
+	durableTask
+
+	started chan struct{}
+	release chan struct{}
+	done    atomic.Bool
+}
+
+func (t *gatedTask) IsCompleted() bool { return t.done.Load() }
+
+func (t *gatedTask) Run(context.Context) error {
+	t.runs.Add(1)
+	close(t.started)
+	<-t.release
+	t.done.Store(true)
+	return nil
+}
+
 type blockingTask struct {
 	durableTask
 

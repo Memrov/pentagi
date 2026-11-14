@@ -91,11 +91,7 @@ func (r durableRunner) ProcessFlowInput(ctx context.Context, req temporal.InputR
 		return err
 	}
 	if req.Recover {
-		last, err := r.lastTaskID(ctx, req.FlowID)
-		if err != nil {
-			return err
-		}
-		return fw.durableRecover(ctx, req, last)
+		return fw.durableRecover(req, func() (int64, error) { return r.lastTaskID(ctx, req.FlowID) })
 	}
 	return fw.durableInput(ctx, req.Input)
 }
@@ -117,7 +113,10 @@ func (fw *flowWorker) durableResume(ctx context.Context) error {
 func (fw *flowWorker) durableInput(ctx context.Context, input string) error {
 	fw.durableMX.Lock()
 	defer fw.durableMX.Unlock()
+	return fw.runInput(input)
+}
 
+func (fw *flowWorker) runInput(input string) error {
 	if fw.ctx.Err() != nil {
 		return temporal.ErrFlowClosed
 	}
@@ -137,43 +136,48 @@ func (fw *flowWorker) durableInput(ctx context.Context, input string) error {
 // while it still waits; a waiting task that took the input and asked the user
 // again cannot be told apart and is fed twice. With neither, a task left
 // running was fed the input and is resumed, or the attempt left no trace and
-// the input is processed afresh.
-func (fw *flowWorker) durableRecover(ctx context.Context, req temporal.InputRequest, lastTaskID int64) error {
-	if lastTaskID > req.LastTaskID {
-		task, err := fw.tc.GetTask(fw.ctx, lastTaskID)
+// the input is processed afresh. The state is read under durableMX, after a
+// timed-out attempt still running in this process has ended.
+func (fw *flowWorker) durableRecover(req temporal.InputRequest, lastTaskID func() (int64, error)) error {
+	fw.durableMX.Lock()
+	defer fw.durableMX.Unlock()
+
+	last, err := lastTaskID()
+	if err != nil {
+		return err
+	}
+	if last > req.LastTaskID {
+		task, err := fw.tc.GetTask(fw.ctx, last)
 		switch {
 		case err != nil:
-			return fw.durableInput(ctx, req.Input)
+			return fw.runInput(req.Input)
 		case task.IsCompleted() || task.IsWaiting():
 			return nil
 		}
-		return fw.durableContinue(ctx, task)
+		return fw.runContinue(task)
 	}
 
 	if req.WaitingTaskID != 0 {
 		task, err := fw.tc.GetTask(fw.ctx, req.WaitingTaskID)
 		switch {
 		case err != nil || task.IsWaiting():
-			return fw.durableInput(ctx, req.Input)
+			return fw.runInput(req.Input)
 		case task.IsCompleted():
 			return nil
 		}
-		return fw.durableContinue(ctx, task)
+		return fw.runContinue(task)
 	}
 
 	for _, task := range fw.tc.ListTasks(fw.ctx) {
 		if !task.IsCompleted() && !task.IsWaiting() {
-			return fw.durableContinue(ctx, task)
+			return fw.runContinue(task)
 		}
 	}
 
-	return fw.durableInput(ctx, req.Input)
+	return fw.runInput(req.Input)
 }
 
-func (fw *flowWorker) durableContinue(ctx context.Context, task TaskWorker) error {
-	fw.durableMX.Lock()
-	defer fw.durableMX.Unlock()
-
+func (fw *flowWorker) runContinue(task TaskWorker) error {
 	if fw.ctx.Err() != nil {
 		return temporal.ErrFlowClosed
 	}
