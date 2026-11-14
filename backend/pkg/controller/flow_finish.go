@@ -28,6 +28,12 @@ func (fc *flowController) missingFlowError(ctx context.Context, flowID int64) er
 }
 
 func (fc *flowController) finishUnloadedFlow(ctx context.Context, flowID int64) error {
+	if fc.engine != nil {
+		if err := fc.engine.FinishFlow(ctx, flowID); err != nil {
+			logrus.WithContext(ctx).WithError(err).Warnf("failed to finish the durable workflow of flow %d", flowID)
+		}
+	}
+
 	flow, err := fc.db.GetFlow(ctx, flowID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

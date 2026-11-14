@@ -1,0 +1,27 @@
+networks:
+  pentagi-network:
+    driver: bridge
+    external: true
+    name: pentagi-network
+
+services:
+  temporal:
+    image: ${TEMPORAL_IMAGE:-temporalio/temporal:1.10.1}
+    restart: unless-stopped
+    container_name: temporal
+    hostname: temporal
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--db-filename", "/data/temporal.db"]
+    ports:
+      - "127.0.0.1:${TEMPORAL_UI_PORT:-8233}:8233"
+    volumes:
+      - temporal-data:/data
+    logging:
+      options:
+        max-size: 50m
+        max-file: "7"
+    networks:
+      - pentagi-network
+
+volumes:
+  temporal-data:
+    driver: local

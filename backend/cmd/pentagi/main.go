@@ -27,6 +27,7 @@ import (
 	"pentagi/pkg/providers"
 	router "pentagi/pkg/server"
 	"pentagi/pkg/server/update"
+	"pentagi/pkg/temporal"
 	"pentagi/pkg/version"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -228,13 +229,35 @@ func main() {
 		logrus.WithError(err).Fatal("LLM provider controller initialization failed")
 	}
 	subscriptions := subscriptions.NewSubscriptionsController()
-	controller := controller.NewFlowController(queries, cfg, client, providers, subscriptions)
+	var (
+		flowOpts []controller.FlowControllerOption
+		durable  *temporal.Client
+	)
+	if cfg.TemporalEnabled {
+		durable, err = temporal.Dial(cfg)
+		if err != nil {
+			logrus.WithError(err).Fatal("Temporal client initialization failed")
+		}
+		defer durable.Close()
+		flowOpts = append(flowOpts, controller.WithFlowEngine(durable))
+	}
+	flowController := controller.NewFlowController(queries, cfg, client, providers, subscriptions, flowOpts...)
 
-	if err := controller.LoadFlows(ctx); err != nil {
+	if err := flowController.LoadFlows(ctx); err != nil {
 		logrus.WithError(err).Fatal("Active flows restoration failed")
 	}
 
-	r := router.NewRouter(queries, orm, cfg, providers, controller, subscriptions, client, updates)
+	if durable != nil {
+		runner, err := controller.NewDurableRunner(flowController)
+		if err != nil {
+			logrus.WithError(err).Fatal("Durable flow runner initialization failed")
+		}
+		if err := durable.StartWorker(runner); err != nil {
+			logrus.WithError(err).Fatal("Temporal worker startup failed")
+		}
+	}
+
+	r := router.NewRouter(queries, orm, cfg, providers, flowController, subscriptions, client, updates)
 
 	// Launch HTTP/HTTPS server in background goroutine
 	serverErrChan := make(chan error, 1)
