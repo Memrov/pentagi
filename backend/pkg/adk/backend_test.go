@@ -1,0 +1,57 @@
+package adk
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestLocalSandbox_Exec_CapturesOutputAndExitCode(t *testing.T) {
+	res, err := LocalSandbox{}.Exec(context.Background(), []string{"sh", "-c", "echo hello; exit 3"}, ExecOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "hello\n", res.Output)
+	assert.Equal(t, 3, res.ExitCode)
+	assert.False(t, res.TimedOut)
+}
+
+func TestLocalSandbox_Exec_KillsOnTimeout(t *testing.T) {
+	ctx := context.Background()
+	res, err := LocalSandbox{}.Exec(ctx, []string{"sleep", "30"}, ExecOptions{Timeout: 100 * time.Millisecond})
+	require.NoError(t, err)
+	assert.True(t, res.TimedOut)
+}
+
+func TestLocalSandbox_Exec_ErrorsOnlyOnSpawnFailure(t *testing.T) {
+	_, err := LocalSandbox{}.Exec(context.Background(), []string{"definitely-not-a-binary-xyz"}, ExecOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "definitely-not-a-binary-xyz")
+
+	res, err := LocalSandbox{}.Exec(context.Background(), nil, ExecOptions{})
+	require.Error(t, err)
+	_ = res
+}
+
+func TestCappedBuffer_Write_DropsPastLimit(t *testing.T) {
+	b := &cappedBuffer{limit: 5}
+	_, _ = b.Write([]byte("hello"))
+	_, _ = b.Write([]byte("world"))
+	assert.Equal(t, "hello", b.buf.String())
+	assert.True(t, b.truncated)
+
+	b2 := &cappedBuffer{limit: 5}
+	_, _ = b2.Write([]byte("hi"))
+	assert.False(t, b2.truncated)
+}
+
+func TestLocalSandbox_Exec_TruncatesHugeOutput(t *testing.T) {
+	res, err := LocalSandbox{}.Exec(context.Background(),
+		[]string{"sh", "-c", "yes abcdefghij | head -c 6000000"}, ExecOptions{Timeout: 30 * time.Second})
+	require.NoError(t, err)
+	assert.True(t, res.Truncated)
+	assert.LessOrEqual(t, len(res.Output), maxExecOutput)
+	assert.True(t, strings.HasPrefix(res.Output, "abcdefghij"))
+}
