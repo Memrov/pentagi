@@ -20,10 +20,6 @@ func NewActivities(runner FlowRunner, interval time.Duration) *Activities {
 	return &Activities{runner: runner, heartbeat: interval}
 }
 
-type inputMark struct {
-	LastTaskID int64
-}
-
 func (a *Activities) ResumeFlow(ctx context.Context, flowID int64) error {
 	defer a.keepAlive(ctx, nil)()
 	return classify(a.runner.ResumeFlow(ctx, flowID))
@@ -35,16 +31,16 @@ func (a *Activities) ResumeFlow(ctx context.Context, flowID int64) error {
 func (a *Activities) ProcessFlowInput(ctx context.Context, args ProcessInputArgs) error {
 	req := InputRequest{FlowID: args.FlowID, Input: args.Input}
 
-	var mark inputMark
+	var mark InputMark
 	if activity.HasHeartbeatDetails(ctx) && activity.GetHeartbeatDetails(ctx, &mark) == nil {
 		req.Recover = true
 		req.LastTaskID = mark.LastTaskID
+		req.WaitingTaskID = mark.WaitingTaskID
 	} else {
-		last, err := a.runner.LastTaskID(ctx, args.FlowID)
-		if err != nil {
+		var err error
+		if mark, err = a.runner.InputMark(ctx, args.FlowID); err != nil {
 			return classify(err)
 		}
-		mark.LastTaskID = last
 	}
 
 	defer a.keepAlive(ctx, mark)()

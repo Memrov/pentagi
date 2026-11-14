@@ -37,12 +37,21 @@ var (
 // InputRequest is one user input handed to a FlowRunner. Recover is set when
 // an earlier attempt of the same input may have started work before it was
 // interrupted; LastTaskID is then the newest task id seen before that first
-// attempt began, so the runner can tell the task it created from older ones.
+// attempt began, so the runner can tell the task it created from older ones,
+// and WaitingTaskID the task that was waiting for this input, if any.
 type InputRequest struct {
-	FlowID     int64
-	Input      string
-	Recover    bool
-	LastTaskID int64
+	FlowID        int64
+	Input         string
+	Recover       bool
+	LastTaskID    int64
+	WaitingTaskID int64
+}
+
+// InputMark is what a flow looked like before the first attempt of an input
+// ran; zero ids mean none.
+type InputMark struct {
+	LastTaskID    int64
+	WaitingTaskID int64
 }
 
 // FlowRunner executes flow work inside the process that owns the flow.
@@ -50,7 +59,7 @@ type InputRequest struct {
 // start while a timed-out attempt is still unwinding.
 type FlowRunner interface {
 	ResumeFlow(ctx context.Context, flowID int64) error
-	LastTaskID(ctx context.Context, flowID int64) (int64, error)
+	InputMark(ctx context.Context, flowID int64) (InputMark, error)
 	ProcessFlowInput(ctx context.Context, req InputRequest) error
 }
 

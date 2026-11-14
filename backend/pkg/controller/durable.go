@@ -57,7 +57,7 @@ func (r durableRunner) ResumeFlow(ctx context.Context, flowID int64) error {
 	return fw.durableResume(ctx)
 }
 
-func (r durableRunner) LastTaskID(ctx context.Context, flowID int64) (int64, error) {
+func (r durableRunner) lastTaskID(ctx context.Context, flowID int64) (int64, error) {
 	tasks, err := r.fc.db.GetFlowTasks(ctx, flowID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get flow %d tasks: %w", flowID, err)
@@ -69,13 +69,29 @@ func (r durableRunner) LastTaskID(ctx context.Context, flowID int64) (int64, err
 	return last, nil
 }
 
+func (r durableRunner) InputMark(ctx context.Context, flowID int64) (temporal.InputMark, error) {
+	fw, err := r.worker(ctx, flowID)
+	if err != nil {
+		return temporal.InputMark{}, err
+	}
+	last, err := r.lastTaskID(ctx, flowID)
+	if err != nil {
+		return temporal.InputMark{}, err
+	}
+	mark := temporal.InputMark{LastTaskID: last}
+	if task := fw.waitingTask(); task != nil {
+		mark.WaitingTaskID = task.GetTaskID()
+	}
+	return mark, nil
+}
+
 func (r durableRunner) ProcessFlowInput(ctx context.Context, req temporal.InputRequest) error {
 	fw, err := r.worker(ctx, req.FlowID)
 	if err != nil {
 		return err
 	}
 	if req.Recover {
-		last, err := r.LastTaskID(ctx, req.FlowID)
+		last, err := r.lastTaskID(ctx, req.FlowID)
 		if err != nil {
 			return err
 		}
@@ -84,12 +100,13 @@ func (r durableRunner) ProcessFlowInput(ctx context.Context, req temporal.InputR
 	return fw.durableInput(ctx, req.Input)
 }
 
-// durableMX serializes runs of one flow: a retried activity may start while
-// the attempt it replaces is still unwinding.
+// durableMX serializes runs of one flow: a retry of a timed-out activity
+// waits for the run it replaces, which is left going rather than stopped,
+// because a stopped task is persisted as Waiting and could no longer be told
+// apart from one that asks the user.
 func (fw *flowWorker) durableResume(ctx context.Context) error {
 	fw.durableMX.Lock()
 	defer fw.durableMX.Unlock()
-	defer fw.stopTaskOnCancel(ctx)()
 
 	if fw.ctx.Err() != nil || !fw.resumeTasks() {
 		return temporal.ErrFlowClosed
@@ -100,7 +117,6 @@ func (fw *flowWorker) durableResume(ctx context.Context) error {
 func (fw *flowWorker) durableInput(ctx context.Context, input string) error {
 	fw.durableMX.Lock()
 	defer fw.durableMX.Unlock()
-	defer fw.stopTaskOnCancel(ctx)()
 
 	if fw.ctx.Err() != nil {
 		return temporal.ErrFlowClosed
@@ -115,13 +131,31 @@ func (fw *flowWorker) durableInput(ctx context.Context, input string) error {
 
 // durableRecover finishes the work of an input whose earlier attempt was
 // interrupted. A task newer than req.LastTaskID was created by that attempt
-// and is resumed unless it already finished or waits for the user; with no
-// such task, a task left running was fed the input and is resumed; with
-// neither, the attempt left no trace and the input is processed afresh.
+// and is resumed unless it already finished or waits for the user; one that
+// did not load died before its subtasks were saved, and the input is
+// processed afresh. The task that waited for the input is fed it again only
+// while it still waits; a waiting task that took the input and asked the user
+// again cannot be told apart and is fed twice. With neither, a task left
+// running was fed the input and is resumed, or the attempt left no trace and
+// the input is processed afresh.
 func (fw *flowWorker) durableRecover(ctx context.Context, req temporal.InputRequest, lastTaskID int64) error {
 	if lastTaskID > req.LastTaskID {
 		task, err := fw.tc.GetTask(fw.ctx, lastTaskID)
-		if err != nil || task.IsCompleted() || task.IsWaiting() {
+		switch {
+		case err != nil:
+			return fw.durableInput(ctx, req.Input)
+		case task.IsCompleted() || task.IsWaiting():
+			return nil
+		}
+		return fw.durableContinue(ctx, task)
+	}
+
+	if req.WaitingTaskID != 0 {
+		task, err := fw.tc.GetTask(fw.ctx, req.WaitingTaskID)
+		switch {
+		case err != nil || task.IsWaiting():
+			return fw.durableInput(ctx, req.Input)
+		case task.IsCompleted():
 			return nil
 		}
 		return fw.durableContinue(ctx, task)
@@ -139,7 +173,6 @@ func (fw *flowWorker) durableRecover(ctx context.Context, req temporal.InputRequ
 func (fw *flowWorker) durableContinue(ctx context.Context, task TaskWorker) error {
 	fw.durableMX.Lock()
 	defer fw.durableMX.Unlock()
-	defer fw.stopTaskOnCancel(ctx)()
 
 	if fw.ctx.Err() != nil {
 		return temporal.ErrFlowClosed
@@ -154,14 +187,13 @@ func (fw *flowWorker) durableContinue(ctx context.Context, task TaskWorker) erro
 	return nil
 }
 
-// stopTaskOnCancel stops the running task when the activity is cancelled or
-// times out, so the run does not go on beside the retry that replaces it.
-func (fw *flowWorker) stopTaskOnCancel(ctx context.Context) (release func() bool) {
-	return context.AfterFunc(ctx, func() {
-		fw.taskMX.Lock()
-		defer fw.taskMX.Unlock()
-		fw.taskST()
-	})
+func (fw *flowWorker) waitingTask() TaskWorker {
+	for _, task := range fw.tc.ListTasks(fw.ctx) {
+		if !task.IsCompleted() && task.IsWaiting() {
+			return task
+		}
+	}
+	return nil
 }
 
 func (fw *flowWorker) start(ctx context.Context) error {

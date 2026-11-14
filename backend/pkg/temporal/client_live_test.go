@@ -19,8 +19,10 @@ type e2eRunner struct {
 	seen  chan InputRequest
 }
 
-func (r *e2eRunner) ResumeFlow(context.Context, int64) error          { return nil }
-func (r *e2eRunner) LastTaskID(context.Context, int64) (int64, error) { return 5, nil }
+func (r *e2eRunner) ResumeFlow(context.Context, int64) error { return nil }
+func (r *e2eRunner) InputMark(context.Context, int64) (InputMark, error) {
+	return InputMark{LastTaskID: 5}, nil
+}
 func (r *e2eRunner) ProcessFlowInput(ctx context.Context, req InputRequest) error {
 	r.seen <- req
 	if r.block {

@@ -1245,6 +1245,9 @@ func (fw *flowWorker) finish() error {
 	fw.cancel()
 	fw.stopReports()
 	fw.wg.Wait()
+	// A durable run is not tracked by wg; it holds durableMX until it unwinds.
+	fw.durableMX.Lock()
+	fw.durableMX.Unlock() //nolint:staticcheck // empty critical section waits for the run
 	fw.waitForReports()
 
 	return nil

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"pentagi/pkg/database"
 	"pentagi/pkg/temporal"
@@ -52,6 +53,7 @@ type durableTask struct {
 	completed bool
 	waiting   bool
 	runs      atomic.Int32
+	fed       bool
 }
 
 func (t *durableTask) GetTaskID() int64                          { return t.id }
@@ -64,6 +66,7 @@ func (t *durableTask) GetStatus(context.Context) (database.TaskStatus, error) {
 }
 
 func (t *durableTask) PutInput(context.Context, string) error {
+	t.fed = true
 	t.waiting = false
 	return nil
 }
@@ -220,16 +223,21 @@ func TestDurable_ProcessFlowInput_Recover(t *testing.T) {
 	cases := []struct {
 		name        string
 		taskIDs     []int64
+		waitingID   int64
 		task        *durableTask
 		wantRuns    int32
 		wantCreated []string
+		wantFed     bool
 	}{
-		{"resumes the task the interrupted attempt created", []int64{5, 9}, &durableTask{id: 9}, 1, nil},
-		{"leaves a created task that already finished", []int64{5, 9}, &durableTask{id: 9, completed: true}, 0, nil},
-		{"leaves a created task waiting for the user", []int64{5, 9}, &durableTask{id: 9, waiting: true}, 0, nil},
-		{"resumes an older task the attempt fed", []int64{5}, &durableTask{id: 5}, 1, nil},
-		{"feeds a waiting task the input it never got", []int64{5}, &durableTask{id: 5, waiting: true}, 1, nil},
-		{"processes an input that left no trace", []int64{5}, &durableTask{id: 5, completed: true}, 0, []string{"scan"}},
+		{"resumes the task the interrupted attempt created", []int64{5, 9}, 0, &durableTask{id: 9}, 1, nil, false},
+		{"leaves a created task that already finished", []int64{5, 9}, 0, &durableTask{id: 9, completed: true}, 0, nil, false},
+		{"leaves a created task waiting for the user", []int64{5, 9}, 0, &durableTask{id: 9, waiting: true}, 0, nil, false},
+		{"processes an input whose created task did not load", []int64{5, 9}, 0, &durableTask{id: 5, completed: true}, 0, []string{"scan"}, false},
+		{"resumes an older task the attempt fed", []int64{5}, 0, &durableTask{id: 5}, 1, nil, false},
+		{"feeds a waiting task the input it never got", []int64{5}, 5, &durableTask{id: 5, waiting: true}, 1, nil, true},
+		{"resumes a fed waiting task left running", []int64{5}, 5, &durableTask{id: 5}, 1, nil, false},
+		{"leaves a fed waiting task that finished", []int64{5}, 5, &durableTask{id: 5, completed: true}, 0, nil, false},
+		{"processes an input that left no trace", []int64{5}, 0, &durableTask{id: 5, completed: true}, 0, []string{"scan"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -237,12 +245,13 @@ func TestDurable_ProcessFlowInput_Recover(t *testing.T) {
 			_, runner := newDurableWorker(t, tasks, &recordingEngine{}, tc.taskIDs...)
 
 			err := runner.ProcessFlowInput(context.Background(), temporal.InputRequest{
-				FlowID: reservedFlowID, Input: "scan", Recover: true, LastTaskID: 5,
+				FlowID: reservedFlowID, Input: "scan", Recover: true, LastTaskID: 5, WaitingTaskID: tc.waitingID,
 			})
 
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantRuns, tc.task.runs.Load())
 			assert.Equal(t, tc.wantCreated, tasks.created)
+			assert.Equal(t, tc.wantFed, tc.task.fed)
 		})
 	}
 }
@@ -275,10 +284,10 @@ func TestDurable_ResumeFlow_ContinuesRunningTasks(t *testing.T) {
 	assert.Equal(t, int32(0), waiting.runs.Load())
 }
 
-func TestDurable_ProcessFlowInput_ActivityCancelStopsTask(t *testing.T) {
+func TestDurable_ProcessFlowInput_ActivityCancelLeavesTaskRunning(t *testing.T) {
 	started := make(chan struct{})
 	task := &blockingTask{durableTask: durableTask{id: 9}, started: started}
-	_, runner := newDurableWorker(t, &durableTasks{tasks: []TaskWorker{task}}, &recordingEngine{}, 5, 9)
+	fw, runner := newDurableWorker(t, &durableTasks{tasks: []TaskWorker{task}}, &recordingEngine{}, 5, 9)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -290,17 +299,44 @@ func TestDurable_ProcessFlowInput_ActivityCancelStopsTask(t *testing.T) {
 
 	controllerReceive(t, started, "the task to start")
 	cancel()
-	require.NoError(t, controllerReceive(t, done, "the cancelled run to return"))
+	select {
+	case err := <-done:
+		t.Fatalf("run returned on activity cancel: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	fw.cancel()
+	require.ErrorIs(t, controllerReceive(t, done, "the run to return once the flow closes"), temporal.ErrFlowClosed)
+}
+
+func TestDurable_Finish_WaitsForRunningActivity(t *testing.T) {
+	started := make(chan struct{})
+	task := &blockingTask{durableTask: durableTask{id: 9}, started: started, unwind: 50 * time.Millisecond}
+	fw, runner := newDurableWorker(t, &durableTasks{tasks: []TaskWorker{task}}, &recordingEngine{}, 5, 9)
+
+	go func() {
+		_ = runner.ProcessFlowInput(context.Background(), temporal.InputRequest{
+			FlowID: reservedFlowID, Input: "scan", Recover: true, LastTaskID: 5,
+		})
+	}()
+	controllerReceive(t, started, "the task to start")
+
+	require.NoError(t, fw.finish())
+	assert.True(t, task.exited.Load())
 }
 
 type blockingTask struct {
 	durableTask
 
 	started chan struct{}
+	unwind  time.Duration
+	exited  atomic.Bool
 }
 
 func (t *blockingTask) Run(ctx context.Context) error {
 	close(t.started)
 	<-ctx.Done()
+	time.Sleep(t.unwind)
+	t.exited.Store(true)
 	return ctx.Err()
 }

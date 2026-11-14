@@ -30,8 +30,8 @@ func (r *fakeRunner) ResumeFlow(ctx context.Context, flowID int64) error {
 	return r.err
 }
 
-func (r *fakeRunner) LastTaskID(ctx context.Context, _ int64) (int64, error) {
-	return r.last, ctx.Err()
+func (r *fakeRunner) InputMark(ctx context.Context, _ int64) (InputMark, error) {
+	return InputMark{LastTaskID: r.last, WaitingTaskID: 4}, ctx.Err()
 }
 
 func (r *fakeRunner) ProcessFlowInput(_ context.Context, req InputRequest) error {
@@ -54,9 +54,9 @@ func TestActivities_ProcessFlowInput_FirstAttemptHeartbeatsLastTaskID(t *testing
 	runner := &fakeRunner{last: 5}
 	env := newActivityEnv(runner)
 
-	var marks []inputMark
+	var marks []InputMark
 	env.SetOnActivityHeartbeatListener(func(_ *activity.Info, details converter.EncodedValues) {
-		var mark inputMark
+		var mark InputMark
 		if details.HasValues() && details.Get(&mark) == nil {
 			marks = append(marks, mark)
 		}
@@ -67,18 +67,18 @@ func TestActivities_ProcessFlowInput_FirstAttemptHeartbeatsLastTaskID(t *testing
 	require.NoError(t, err)
 	assert.Equal(t, []InputRequest{{FlowID: 3, Input: "scan"}}, runner.requests)
 	require.NotEmpty(t, marks)
-	assert.Equal(t, inputMark{LastTaskID: 5}, marks[0])
+	assert.Equal(t, InputMark{LastTaskID: 5, WaitingTaskID: 4}, marks[0])
 }
 
 func TestActivities_ProcessFlowInput_RetryRecoversFromHeartbeat(t *testing.T) {
 	runner := &fakeRunner{last: 9}
 	env := newActivityEnv(runner)
-	env.SetHeartbeatDetails(inputMark{LastTaskID: 5})
+	env.SetHeartbeatDetails(InputMark{LastTaskID: 5, WaitingTaskID: 4})
 
 	_, err := env.ExecuteActivity(ProcessInputActivity, ProcessInputArgs{FlowID: 3, Input: "scan"})
 
 	require.NoError(t, err)
-	assert.Equal(t, []InputRequest{{FlowID: 3, Input: "scan", Recover: true, LastTaskID: 5}}, runner.requests)
+	assert.Equal(t, []InputRequest{{FlowID: 3, Input: "scan", Recover: true, LastTaskID: 5, WaitingTaskID: 4}}, runner.requests)
 }
 
 func TestActivities_ProcessFlowInput_ClosedFlowIsNotRetried(t *testing.T) {
