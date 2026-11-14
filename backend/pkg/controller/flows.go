@@ -140,6 +140,7 @@ type flowController struct {
 	vslc   VectorStoreLogController
 	tclc   ToolCallLogController
 	sc     ScreenshotController
+	engine FlowEngine
 
 	build func(ctx context.Context, flow database.Flow, fwc newFlowWorkerCtx, commit func() error) (FlowWorker, error)
 }
@@ -150,8 +151,9 @@ func NewFlowController(
 	docker docker.DockerClient,
 	provs providers.ProviderController,
 	subs subscriptions.SubscriptionsController,
+	opts ...FlowControllerOption,
 ) FlowController {
-	return &flowController{
+	fc := &flowController{
 		db:     db,
 		mx:     &sync.Mutex{},
 		cfg:    cfg,
@@ -169,6 +171,11 @@ func NewFlowController(
 		sc:     NewScreenshotController(db),
 		build:  buildFlowWorker,
 	}
+	for _, opt := range opts {
+		opt(fc)
+	}
+
+	return fc
 }
 
 func (fc *flowController) register(flowID int64, worker FlowWorker) *flowEntry {
@@ -389,6 +396,7 @@ func (fc *flowController) flowWorkerCtx() flowWorkerCtx {
 		docker: fc.docker,
 		provs:  fc.provs,
 		subs:   fc.subs,
+		engine: fc.engine,
 		flowProviderControllers: flowProviderControllers{
 			mlc:  fc.mlc,
 			aslc: fc.aslc,

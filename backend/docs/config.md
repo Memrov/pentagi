@@ -87,6 +87,9 @@ This document serves as a comprehensive guide to the configuration system in Pen
     - [Client Lifecycle and Failure Behavior](#client-lifecycle-and-failure-behavior)
     - [Data Flow, Search, and Tenancy](#data-flow-search-and-tenancy)
     - [Deployment Ownership](#deployment-ownership)
+  - [Temporal Durable Execution Settings](#temporal-durable-execution-settings)
+    - [How a Durable Flow Runs](#how-a-durable-flow-runs)
+    - [Recovery Semantics](#recovery-semantics)
   - [Agent Supervision Settings](#agent-supervision-settings)
     - [Usage Details](#usage-details-12)
     - [Supervision System Integration](#supervision-system-integration)
@@ -1999,6 +2002,32 @@ The bundled stack is separate from `docker-compose.yml`. The installer distingui
 Installer assets include `docker-compose-graphiti.yml` and the `graphiti` preset directory sourced from `examples/graphiti`. The target directory is checked, repaired, and removed with the Graphiti stack. Compose mounts it through `GRAPHITI_CONFIG_PATH` and `GRAPHITI_CONFIG_DIR`; the fallback target `configs` prevents a newer compose file paired with an older `.env` from masking the image's built-in `llm_configs` with an empty host directory.
 
 Models and call parameters belong to the provider YAML presets, selected by `GRAPHITI_LLM_CLIENT_TYPE`; they are not fields in the PentAGI Go configuration. `GRAPHITI_MODEL_NAME` is obsolete. Refer operators to the README instead of duplicating the sidecar's tuning reference here.
+
+## Temporal Durable Execution Settings
+
+With `TEMPORAL_ENABLED=true` each flow is driven by a Temporal workflow instead of the in-process worker goroutine. User input is recorded in the workflow history before `PutInput` returns, and a run interrupted by a backend crash or restart is retried by Temporal rather than waiting for the next user message. With the flag off (the default) nothing changes.
+
+| Field | Environment Variable | Default | Responsibility |
+| --- | --- | --- | --- |
+| `TemporalEnabled` | `TEMPORAL_ENABLED` | `false` | Drive flows through Temporal |
+| `TemporalHostPort` | `TEMPORAL_HOST_PORT` | `localhost:7233` | Temporal frontend address; the compose overlay uses `temporal:7233` |
+| `TemporalNamespace` | `TEMPORAL_NAMESPACE` | `default` | Temporal namespace |
+| `TemporalTaskQueue` | `TEMPORAL_TASK_QUEUE` | `pentagi-flows` | Task queue, prefixed with `TENANT_ID` when set |
+| `TemporalActivityTimeout` | `TEMPORAL_ACTIVITY_TIMEOUT` | `86400` seconds | Upper bound on one task run |
+| `TemporalHeartbeatTimeout` | `TEMPORAL_HEARTBEAT_TIMEOUT` | `60` seconds | How long a silent run is trusted before Temporal retries it |
+| `TemporalMaxAttempts` | `TEMPORAL_MAX_ATTEMPTS` | `10` | Attempts per input before the workflow moves to the next one |
+
+For local development run `temporal server start-dev` (UI on `http://localhost:8233`), or start the overlay with `docker compose -f docker-compose.yml -f docker-compose-temporal.yml up -d` and set `TEMPORAL_HOST_PORT=temporal:7233`. The overlay runs the single-process dev server with a SQLite file; use a production Temporal cluster or Temporal Cloud for real deployments.
+
+### How a Durable Flow Runs
+
+The workflow id is `<tenant>-pentagi-flow-<id>`. `FlowWorkflow` (`pkg/temporal/workflow.go`) keeps the queue of inputs and runs them one at a time through two activities: `pentagi.ResumeFlow` continues the tasks left running when the flow was loaded, and `pentagi.ProcessFlowInput` runs one input through the existing `flowWorker.processInput` path. Finishing a flow signals the workflow, which cancels the run in flight and completes. A stop from the UI stops the running task exactly as before and the workflow moves to the next input.
+
+The agent still runs inside the PentAGI process: activities reach the loaded `flowWorker` through `controller.NewDurableRunner`. The worker therefore starts after `LoadFlows`, and only one PentAGI process per tenant may poll the task queue.
+
+### Recovery Semantics
+
+A run that stops heartbeating — the process died, or lost the Temporal server for longer than `TEMPORAL_HEARTBEAT_TIMEOUT` — is retried with exponential backoff. A run that is still alive is not stopped: its retry waits for it to end, because a stopped task is saved as Waiting and would look like a task asking the user. The first heartbeat of `ProcessFlowInput` records the newest task id and the task waiting for input, so the retry resumes the task the interrupted attempt created or fed instead of creating a second task from the same input. One case cannot be told apart: a waiting task that took the input and asked the user again is fed the same input twice. Finishing a flow waits for its running activity to unwind before the tasks are closed. A task that ends with an error is not retried by Temporal: it is reported in the flow and the flow returns to Waiting, as without Temporal. Individual LLM and tool calls are not yet separate activities, so a retry resumes from the last subtask boundary persisted in PostgreSQL.
 
 ## Agent Supervision Settings
 

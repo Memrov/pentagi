@@ -73,6 +73,8 @@ type flowWorker struct {
 	taskCMX   sync.Mutex
 	taskCCH   chan struct{}
 	input     chan flowInput
+	engine    FlowEngine
+	durableMX sync.Mutex
 	flowCtx   *FlowContext
 	docker    docker.DockerClient
 	logger    *logrus.Entry
@@ -96,6 +98,7 @@ type flowWorkerCtx struct {
 	docker docker.DockerClient
 	provs  providers.ProviderController
 	subs   subscriptions.SubscriptionsController
+	engine FlowEngine
 
 	flowProviderControllers
 }
@@ -291,6 +294,7 @@ func buildFlowWorker(
 		taskWG:  &sync.WaitGroup{},
 		taskCCH: make(chan struct{}),
 		input:   make(chan flowInput),
+		engine:  fwc.engine,
 		flowCtx: flowCtx,
 		docker:  fwc.docker,
 		logger: logrus.WithFields(logrus.Fields{
@@ -322,8 +326,9 @@ func buildFlowWorker(
 
 	pub.FlowUpdated(ctx, flow, containers)
 
-	fw.wg.Add(1)
-	go fw.worker()
+	if err := fw.start(ctx); err != nil {
+		return nil, wrapErrorEndSpan(ctx, flowSpan, "failed to start flow worker", err)
+	}
 
 	if !fwc.dryRun {
 		if err := fw.PutInput(ctx, fwc.input, nil, fwc.resources); err != nil {
@@ -459,6 +464,7 @@ func LoadFlowWorker(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) 
 		taskWG:  &sync.WaitGroup{},
 		taskCCH: make(chan struct{}),
 		input:   make(chan flowInput),
+		engine:  fwc.engine,
 		flowCtx: flowCtx,
 		docker:  fwc.docker,
 		logger: logrus.WithFields(logrus.Fields{
@@ -517,8 +523,9 @@ func LoadFlowWorker(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) 
 
 	fw.flowCtx.Publisher.FlowUpdated(ctx, flow, containers)
 
-	fw.wg.Add(1)
-	go fw.worker()
+	if err := fw.start(ctx); err != nil {
+		return nil, wrapErrorEndSpan(ctx, flowSpan, "failed to start flow worker", err)
+	}
 
 	flowSpan.End(langfuse.WithSpanStatus("flow worker restored"))
 
@@ -698,6 +705,13 @@ func (fw *flowWorker) PutInput(
 		fw.logger.WithError(err).Warn("failed to copy resources before user input")
 	}
 
+	if fw.engine != nil {
+		if err := fw.engine.SignalInput(ctx, fw.flowCtx.FlowID, input); err != nil {
+			return fmt.Errorf("flow %d: %w: %w", fw.flowCtx.FlowID, ErrInputNotAccepted, err)
+		}
+		return nil
+	}
+
 	flin := flowInput{input: input, reply: newInputReply()}
 	select {
 	case <-fw.ctx.Done():
@@ -841,6 +855,12 @@ func (fw *flowWorker) publishResourceFileEvents(ctx context.Context, addedPaths 
 func (fw *flowWorker) Finish(ctx context.Context) error {
 	ctx, span := obs.Observer.NewSpan(ctx, obs.SpanKindInternal, "controller.flowWorker.Finish")
 	defer span.End()
+
+	if fw.engine != nil && fw.ctx.Err() == nil {
+		if err := fw.engine.FinishFlow(ctx, fw.flowCtx.FlowID); err != nil {
+			fw.logger.WithError(err).Warn("failed to finish the durable flow workflow")
+		}
+	}
 
 	if err := fw.finish(); err != nil {
 		return err
@@ -1225,6 +1245,9 @@ func (fw *flowWorker) finish() error {
 	fw.cancel()
 	fw.stopReports()
 	fw.wg.Wait()
+	// A durable run is not tracked by wg; it holds durableMX until it unwinds.
+	fw.durableMX.Lock()
+	fw.durableMX.Unlock() //nolint:staticcheck // empty critical section waits for the run
 	fw.waitForReports()
 
 	return nil
@@ -1288,44 +1311,10 @@ func (fw *flowWorker) WaitTaskCompletion(ctx context.Context) error {
 func (fw *flowWorker) worker() {
 	defer fw.wg.Done()
 
-	_, observation := obs.Observer.NewObservation(fw.ctx)
-
-	getLogger := func(input string, task TaskWorker) *logrus.Entry {
-		logger := fw.logger.WithField("input", input)
-		if task != nil {
-			logger = logger.WithFields(logrus.Fields{
-				"task_id":       task.GetTaskID(),
-				"task_complete": task.IsCompleted(),
-				"task_waiting":  task.IsWaiting(),
-				"task_title":    task.GetTitle(),
-				"trace_id":      observation.TraceID(),
-			})
-		}
-		return logger
+	if !fw.resumeTasks() {
+		return
 	}
 
-	// continue incomplete tasks after loading
-	for _, task := range fw.tc.ListTasks(fw.ctx) {
-		if !task.IsCompleted() && !task.IsWaiting() {
-			input := "continue after loading"
-			spanName := fmt.Sprintf("continue task %d: %s", task.GetTaskID(), task.GetTitle())
-			if err := fw.reportFailure(task, input, fw.runTask(spanName, input, task)); err != nil {
-				if errors.Is(err, context.Canceled) {
-					getLogger(input, task).Info("flow are going to be stopped by user")
-					return
-				} else {
-					getLogger(input, task).WithError(err).Error("failed to continue task")
-
-					// anyway there need to set flow status to Waiting new user input even an error happened
-					_ = fw.SetStatus(fw.ctx, database.FlowStatusWaiting)
-				}
-			} else {
-				getLogger(input, task).Info("task continued successfully")
-			}
-		}
-	}
-
-	// process user input in regular job
 	for {
 		var flin flowInput
 		select {
@@ -1334,20 +1323,56 @@ func (fw *flowWorker) worker() {
 		case flin = <-fw.input:
 		}
 
-		if task, err := fw.processInput(flin); err != nil {
-			if errors.Is(err, context.Canceled) {
-				getLogger(flin.input, task).Info("flow are going to be stopped by user")
-				return
-			} else {
-				getLogger(flin.input, task).WithError(err).Error("failed to process input")
-
-				// anyway there need to set flow status to Waiting new user input even an error happened
-				_ = fw.SetStatus(fw.ctx, database.FlowStatusWaiting)
-			}
-		} else {
-			getLogger(flin.input, task).Info("user input processed")
+		task, err := fw.processInput(flin)
+		if !fw.settle(flin.input, task, err, "failed to process input", "user input processed") {
+			return
 		}
 	}
+}
+
+// resumeTasks continues the tasks left running when the flow was loaded. It
+// returns false once the flow is being closed.
+func (fw *flowWorker) resumeTasks() bool {
+	for _, task := range fw.tc.ListTasks(fw.ctx) {
+		if !task.IsCompleted() && !task.IsWaiting() {
+			input := "continue after loading"
+			spanName := fmt.Sprintf("continue task %d: %s", task.GetTaskID(), task.GetTitle())
+			err := fw.reportFailure(task, input, fw.runTask(spanName, input, task))
+			if !fw.settle(input, task, err, "failed to continue task", "task continued successfully") {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+// settle logs how a run ended and returns the flow to Waiting after a failure,
+// so the user can send the next input. It returns false once the flow is
+// being closed.
+func (fw *flowWorker) settle(input string, task TaskWorker, err error, failMsg, okMsg string) bool {
+	logger := fw.logger.WithField("input", input)
+	if task != nil {
+		logger = logger.WithFields(logrus.Fields{
+			"task_id":       task.GetTaskID(),
+			"task_complete": task.IsCompleted(),
+			"task_waiting":  task.IsWaiting(),
+			"task_title":    task.GetTitle(),
+		})
+	}
+
+	switch {
+	case errors.Is(err, context.Canceled):
+		logger.Info("flow are going to be stopped by user")
+		return false
+	case err != nil:
+		logger.WithError(err).Error(failMsg)
+		_ = fw.SetStatus(fw.ctx, database.FlowStatusWaiting)
+	default:
+		logger.Info(okMsg)
+	}
+
+	return true
 }
 
 func (fw *flowWorker) processInput(flin flowInput) (TaskWorker, error) {

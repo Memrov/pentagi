@@ -307,6 +307,15 @@ type Config struct {
 	GraphitiTimeout int    `env:"GRAPHITI_TIMEOUT" envDefault:"30"`
 	GraphitiURL     string `env:"GRAPHITI_URL"`
 
+	// === Durable Execution: Temporal ===
+	TemporalEnabled          bool   `env:"TEMPORAL_ENABLED" envDefault:"false"`
+	TemporalHostPort         string `env:"TEMPORAL_HOST_PORT" envDefault:"localhost:7233"`
+	TemporalNamespace        string `env:"TEMPORAL_NAMESPACE" envDefault:"default"`
+	TemporalTaskQueue        string `env:"TEMPORAL_TASK_QUEUE" envDefault:"pentagi-flows"`
+	TemporalActivityTimeout  int    `env:"TEMPORAL_ACTIVITY_TIMEOUT" envDefault:"86400"`
+	TemporalHeartbeatTimeout int    `env:"TEMPORAL_HEARTBEAT_TIMEOUT" envDefault:"60"`
+	TemporalMaxAttempts      int    `env:"TEMPORAL_MAX_ATTEMPTS" envDefault:"10"`
+
 	// === Agent Execution Monitoring ===
 	ExecutionMonitorEnabled        bool `env:"EXECUTION_MONITOR_ENABLED" envDefault:"false"`
 	ExecutionMonitorSameToolLimit  int  `env:"EXECUTION_MONITOR_SAME_TOOL_LIMIT" envDefault:"5"`
