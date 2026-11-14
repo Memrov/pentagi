@@ -76,6 +76,17 @@ func FlowWorkflow(ctx workflow.Context, params FlowParams) error {
 	for !finished {
 		if len(pending) == 0 {
 			if workflow.GetInfo(ctx).GetContinueAsNewSuggested() {
+				// Signals still buffered in the channels would be dropped
+				// with this run.
+				for idle.HasPending() {
+					idle.Select(ctx)
+				}
+				if finished {
+					break
+				}
+				if len(pending) > 0 {
+					continue
+				}
 				return workflow.NewContinueAsNewError(ctx, FlowWorkflowName, FlowParams{
 					FlowID: params.FlowID,
 					Policy: params.Policy,
