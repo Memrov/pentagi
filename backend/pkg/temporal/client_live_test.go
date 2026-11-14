@@ -1,21 +1,20 @@
 //go:build temporal_e2e
 
+// Needs a Temporal dev server on localhost:7233: temporal server start-dev
+
 package temporal
 
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 
 	"pentagi/pkg/config"
 
 	"github.com/stretchr/testify/require"
-	enumspb "go.temporal.io/api/enums/v1"
 )
 
 type e2eRunner struct {
-	mx    sync.Mutex
 	block bool
 	seen  chan InputRequest
 }
@@ -31,7 +30,7 @@ func (r *e2eRunner) ProcessFlowInput(ctx context.Context, req InputRequest) erro
 	return nil
 }
 
-func TestE2E_DevServer_RetryRecoversAfterWorkerLoss(t *testing.T) {
+func TestClient_StartWorker_RetryRecoversAfterWorkerLoss(t *testing.T) {
 	cfg := &config.Config{TemporalHostPort: "localhost:7233", TemporalNamespace: "default",
 		TemporalTaskQueue: "e2e-" + time.Now().Format("150405"), TemporalActivityTimeout: 600,
 		TemporalHeartbeatTimeout: 3, TemporalMaxAttempts: 5}
@@ -75,9 +74,8 @@ func TestE2E_DevServer_RetryRecoversAfterWorkerLoss(t *testing.T) {
 	}
 
 	require.NoError(t, b.FinishFlow(ctx, flowID))
-	require.Eventually(t, func() bool {
-		d, err := b.client.DescribeWorkflowExecution(ctx, b.WorkflowID(flowID), "")
-		return err == nil && d.WorkflowExecutionInfo.Status == enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED
-	}, 30*time.Second, 500*time.Millisecond)
+	wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	require.NoError(t, b.client.GetWorkflow(wctx, b.WorkflowID(flowID), "").Get(wctx, nil))
 	t.Logf("workflow %s completed", b.WorkflowID(flowID))
 }
