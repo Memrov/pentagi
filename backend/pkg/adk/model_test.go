@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -14,11 +15,13 @@ import (
 )
 
 // chatCompletionsFixture serves one canned chat completion and records how it
-// was called: path, auth header and the model the client asked for.
+// was called: path, headers and the model the client asked for.
 type chatCompletionsFixture struct {
 	srv         *httptest.Server
 	path        string
 	auth        string
+	userAgent   string
+	session     string
 	model       string
 	lastRequest map[string]any
 }
@@ -28,6 +31,8 @@ func newChatCompletionsFixture(t *testing.T, response map[string]any) *chatCompl
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.path = r.URL.Path
 		f.auth = r.Header.Get("Authorization")
+		f.userAgent = r.Header.Get("User-Agent")
+		f.session = r.Header.Get("x-opencode-session")
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&f.lastRequest))
 		f.model, _ = f.lastRequest["model"].(string)
 		w.Header().Set("Content-Type", "application/json")
@@ -73,4 +78,6 @@ func TestModelFactory_ChatCompletions_RoundTrip(t *testing.T) {
 	assert.Equal(t, "/chat/completions", fixture.path)
 	assert.Equal(t, "Bearer zen-key-123", fixture.auth)
 	assert.Equal(t, "deepseek-v4.1-flash", fixture.model)
+	assert.Equal(t, "pentagi-adk/1.0", fixture.userAgent)
+	assert.True(t, strings.HasPrefix(fixture.session, "pentagi-"), "session %q", fixture.session)
 }

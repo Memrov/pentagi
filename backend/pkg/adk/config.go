@@ -8,7 +8,10 @@ import (
 )
 
 const (
-	DefaultBaseURL   = "https://opencode.ai/zen/v1"
+	// DefaultBaseURL is OpenCode Go's OpenAI-compatible base; /chat/completions
+	// or /responses is appended by the client. Console translates every text
+	// model across APIs, so the chat-completions path serves all of them.
+	DefaultBaseURL   = "https://opencode.ai/inference/go/openai/v1"
 	DefaultModelName = "deepseek-v4.1-flash"
 )
 
@@ -18,7 +21,7 @@ const (
 // crosses into a workflow.
 type Config struct {
 	APIKey    string `env:"ADK_API_KEY"`
-	BaseURL   string `env:"ADK_BASE_URL" envDefault:"https://opencode.ai/zen/v1"`
+	BaseURL   string `env:"ADK_BASE_URL" envDefault:"https://opencode.ai/inference/go/openai/v1"`
 	ModelName string `env:"ADK_MODEL_NAME" envDefault:"deepseek-v4.1-flash"`
 	ModelAPI  string `env:"ADK_MODEL_API" envDefault:"chat_completions"`
 	TaskQueue string `env:"ADK_TASK_QUEUE" envDefault:"pentagi-adk"`

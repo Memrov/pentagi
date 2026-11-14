@@ -27,7 +27,7 @@ func TestConfig_LoadConfig_Defaults(t *testing.T) {
 
 	cfg, err := LoadConfig()
 	require.NoError(t, err)
-	assert.Equal(t, "https://opencode.ai/zen/v1", cfg.BaseURL)
+	assert.Equal(t, "https://opencode.ai/inference/go/openai/v1", cfg.BaseURL)
 	assert.Equal(t, "deepseek-v4.1-flash", cfg.ModelName)
 	assert.Equal(t, "chat_completions", cfg.ModelAPI)
 	assert.Equal(t, "local", cfg.Sandbox)

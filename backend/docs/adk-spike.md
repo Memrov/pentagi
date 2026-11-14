@@ -10,7 +10,7 @@ The integration is `go.temporal.io/googleadk`. The agent loop runs inside `penta
 - Worker side (`worker.go`, `model.go`, `activities.go`, `backend.go`, `payload.go`): `WorkerPlugin` registers `InvokeModel` with a `ModelFactory` that rebuilds the real `openaimodel` inside the activity boundary. The API key lives in the factory closure and never enters workflow history. `Activities` runs each tool inside a `Sandbox` — `DockerSandbox` for a container or `LocalSandbox` for development — and hands oversized output to a `PayloadStore` (S3 URI today, in-memory for tests) instead of bloating history.
 - Retries are owned by Temporal alone: the openai-go client is constructed with `WithMaxRetries(0)` so a transient failure is not retried twice over.
 
-The model is any OpenAI-compatible chat-completions endpoint. Default target is OpenCode Zen: `ADK_BASE_URL=https://opencode.ai/zen/v1`, `ADK_MODEL_NAME=deepseek-v4.1-flash` (the current DeepSeek Flash; Zen model IDs change, check the live catalog). `ADK_MODEL_API` selects `chat_completions` (default, what Zen's DeepSeek models serve) or `responses` for providers that speak the Responses API.
+The model is any OpenAI-compatible chat-completions endpoint. The default target is **OpenCode Go** (the subscription tier): `ADK_BASE_URL=https://opencode.ai/inference/go/openai/v1`, `ADK_MODEL_NAME=deepseek-v4.1-flash` (verified in the live Go catalog; Console translates every text model across APIs, so the chat-completions path serves all of them). `ADK_MODEL_API` selects `chat_completions` (default) or `responses` for providers that speak the Responses API. Go's terms require a client-specific user agent and a stable `x-opencode-session` per conversation — `ModelFactory` sends `pentagi-adk/1.0` and derives the session from the workflow ID, so every turn of a run shares one value including across retries. DeepSeek models require Settings › Privacy › Regions: Global on the OpenCode workspace.
 
 ## Human-in-the-loop and scope seam
 
@@ -19,6 +19,8 @@ The model is any OpenAI-compatible chat-completions endpoint. Default target is 
 `ScopeGuard` in `agent.go` is the isolated seam for the authorization checks the production port will wire; it is unset and must default to allowing. The existing prompts and the scope/authorization guards elsewhere are untouched on purpose.
 
 ## Running
+
+Credentials live outside the repository: export them in the shell or keep a `~/.pentagi-secrets.env` file — a `.env` in the tree is gitignored but outside it cannot be committed at all. Nothing secret goes to GitHub; the repo is public.
 
 ```bash
 cd backend
@@ -29,6 +31,11 @@ ADK_API_KEY=... go run ./cmd/adkpentest direct "probe https://scanme.sh and summ
 temporal server start-dev &
 ADK_API_KEY=... go run ./cmd/adkpentest worker
 ADK_API_KEY=... go run ./cmd/adkpentest run "probe https://scanme.sh and summarize"
+
+# Temporal Cloud instead of a local server
+export TEMPORAL_HOST_PORT=<namespace>.tmprl.cloud:7233
+export TEMPORAL_NAMESPACE=<namespace>.<account>
+export TEMPORAL_API_KEY=...   # enables TLS + API-key auth
 ```
 
 `ADK_SANDBOX=local` (default) executes on the host — development only, unsandboxed. `ADK_SANDBOX=docker` with `ADK_SANDBOX_CONTAINER=<name>` execs into a running container through the same exec calls `docker.DockerClient` makes; binding the sandbox to the flow's primary container is the production wiring left for the port. `ADK_PAYLOAD_BUCKET` enables S3 offload for outputs over `ADK_PAYLOAD_THRESHOLD` (16 KiB default, matching `tools.DefaultResultSizeLimit`).
