@@ -45,10 +45,11 @@ export TEMPORAL_API_KEY=...   # enables TLS + API-key auth
 - Unit tests cover the whole loop offline: `googleadk.NewFakeModel` scripts tool-call-then-answer turns through the real `PentesterWorkflow` in the Temporal test environment, asserting per-activity dispatch counts (one `InvokeModel` per turn, one attempt for non-retryable validation errors) and that tool errors reach the model per ADK's contract.
 - The chat-completions adapter is exercised against an httptest server asserting path, `Authorization: Bearer`, model name and response decoding.
 - `LocalSandbox` semantics: exit codes, timeout kill, output cap.
+- Tool activities heartbeat every 5 s against a 30 s `HeartbeatTimeout`, so a dead worker is detected in tens of seconds instead of waiting out the 10-minute `StartToCloseTimeout`; a live worker-restart run on Temporal Cloud confirmed the retry-onto-new-worker path. Cancellation also kills the whole process group — locally via `Setpgid`, in Docker via a PID marker file and a cleanup exec.
 
 ## Open gaps for the port
 
-- Binding `DockerSandbox` to the flow's primary container and syncing `pkg/docker`'s flow markers for the kill sweep.
+- Binding `DockerSandbox` to the flow's primary container; cancellation uses its own per-exec PID markers, not yet synced with `pkg/docker`'s kill sweep.
 - Fetching `payload_uri` blobs back when the model needs more than the preview.
 - Session carry-over across continue-as-new (`googleadk.ExportSession`/`ImportSession`) for long tasks — the workflow is single-run today.
 - Mapping PentAGI's task/subtask lifecycle, message chains and Langfuse observations onto ADK sessions and plugin telemetry.

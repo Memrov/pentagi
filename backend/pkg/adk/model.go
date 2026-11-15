@@ -35,8 +35,7 @@ func ModelFactory(cfg *Config) googleadk.ModelFactory {
 }
 
 // Inside InvokeModel the activity context carries the workflow ID; direct mode
-// is not an activity (GetInfo panics there), so each in-process run gets one
-// fresh ID of its own.
+// has none, so each in-process run gets one fresh session ID of its own.
 func sessionID(ctx context.Context) string {
 	if activity.IsActivity(ctx) {
 		if id := activity.GetInfo(ctx).WorkflowExecution.ID; id != "" {

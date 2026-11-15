@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/caarlos0/env/v10"
+	"google.golang.org/adk/v2/model/openaimodel"
 )
 
 const (
@@ -61,6 +62,12 @@ func (c *Config) Validate() error {
 	}
 	if c.PayloadThreshold <= 0 {
 		return fmt.Errorf("ADK_PAYLOAD_THRESHOLD must be positive, got %d", c.PayloadThreshold)
+	}
+	switch openaimodel.API(c.ModelAPI) {
+	case openaimodel.APIChatCompletions, openaimodel.APIResponses:
+	default:
+		return fmt.Errorf("ADK_MODEL_API must be %s or %s, got %q",
+			openaimodel.APIChatCompletions, openaimodel.APIResponses, c.ModelAPI)
 	}
 	return nil
 }

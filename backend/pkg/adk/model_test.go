@@ -33,10 +33,10 @@ func newChatCompletionsFixture(t *testing.T, response map[string]any) *chatCompl
 		f.auth = r.Header.Get("Authorization")
 		f.userAgent = r.Header.Get("User-Agent")
 		f.session = r.Header.Get("x-opencode-session")
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&f.lastRequest))
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&f.lastRequest))
 		f.model, _ = f.lastRequest["model"].(string)
 		w.Header().Set("Content-Type", "application/json")
-		require.NoError(t, json.NewEncoder(w).Encode(response))
+		assert.NoError(t, json.NewEncoder(w).Encode(response))
 	}))
 	t.Cleanup(f.srv.Close)
 	return f

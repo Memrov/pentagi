@@ -41,7 +41,7 @@ func TestConfig_Validate_RequiresAPIKey(t *testing.T) {
 }
 
 func TestConfig_Validate_DockerRequiresContainer(t *testing.T) {
-	cfg := &Config{APIKey: "k", Sandbox: "docker", PayloadThreshold: 1}
+	cfg := &Config{APIKey: "k", Sandbox: "docker", PayloadThreshold: 1, ModelAPI: "chat_completions"}
 	assert.ErrorContains(t, cfg.Validate(), "ADK_SANDBOX_CONTAINER")
 
 	cfg.SandboxContainer = "sandbox-1"

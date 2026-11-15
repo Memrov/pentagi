@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -42,7 +43,7 @@ func (s *MemoryPayloadStore) Get(key string) ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	data, ok := s.blobs[key]
-	return data, ok
+	return slices.Clone(data), ok
 }
 
 // s3API is the single call the store makes, narrow enough to fake in tests.

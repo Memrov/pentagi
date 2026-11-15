@@ -10,6 +10,15 @@ import (
 	"go.temporal.io/sdk/temporal"
 )
 
+const (
+	// toolHeartbeatInterval paces RecordHeartbeat from each activity;
+	// toolHeartbeatTimeout is the workflow-side bound it must fit inside, so a
+	// dead worker is detected in tens of seconds instead of waiting out the
+	// full StartToCloseTimeout.
+	toolHeartbeatInterval = 5 * time.Second
+	toolHeartbeatTimeout  = 30 * time.Second
+)
+
 // Activities are the worker-side implementations behind the durable tools;
 // every method executes inside one sandboxed activity attempt.
 type Activities struct {
@@ -44,6 +53,7 @@ func (a *Activities) TerminalExec(ctx context.Context, in TerminalExecInput) (To
 	if strings.TrimSpace(in.Command) == "" {
 		return ToolResult{}, nonRetryable("terminal command is required")
 	}
+	defer heartbeat(ctx)()
 	res, err := a.sandbox.Exec(ctx, []string{"sh", "-c", in.Command}, ExecOptions{
 		Cwd:     in.Cwd,
 		Timeout: boundedTimeout(in.TimeoutSeconds, a.defTimeout),
@@ -65,6 +75,7 @@ func (a *Activities) NucleiScan(ctx context.Context, in NucleiScanInput) (ToolRe
 	if len(in.Tags) > 0 {
 		argv = append(argv, "-tags", strings.Join(in.Tags, ","))
 	}
+	defer heartbeat(ctx)()
 	res, err := a.sandbox.Exec(ctx, argv, ExecOptions{Timeout: a.defTimeout})
 	if err != nil {
 		return ToolResult{}, err
@@ -89,6 +100,7 @@ func (a *Activities) HttpxProbe(ctx context.Context, in HttpxProbeInput) (ToolRe
 	if in.FollowRedirect {
 		argv = append(argv, "-follow-redirects")
 	}
+	defer heartbeat(ctx)()
 	res, err := a.sandbox.Exec(ctx, argv, ExecOptions{Timeout: a.defTimeout})
 	if err != nil {
 		return ToolResult{}, err
@@ -124,10 +136,38 @@ func (a *Activities) finish(ctx context.Context, res ExecResult) ToolResult {
 }
 
 func payloadKey(ctx context.Context) string {
+	if !activity.IsActivity(ctx) {
+		return ""
+	}
 	if info := activity.GetInfo(ctx); info.ActivityID != "" {
 		return fmt.Sprintf("%s/%s-attempt%d.log", info.WorkflowExecution.ID, info.ActivityID, info.Attempt)
 	}
 	return ""
+}
+
+// heartbeat pings the Temporal service while the sandboxed command runs; the
+// returned func stops the ticker and is meant to be deferred. Outside an
+// activity (direct mode, unit tests) it is a no-op.
+func heartbeat(ctx context.Context) func() {
+	if !activity.IsActivity(ctx) {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(toolHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				activity.RecordHeartbeat(ctx)
+			}
+		}
+	}()
+	return func() { close(done) }
 }
 
 func boundedTimeout(seconds int, def time.Duration) time.Duration {

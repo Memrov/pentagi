@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/moby/moby/client"
 )
 
@@ -53,8 +54,9 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 }
 
 // LocalSandbox execs on the host: development and tests only, there is no
-// isolation. Production wiring must hand the tools a DockerSandbox bound to the
-// flow's worker container.
+// isolation. Commands run in their own process group so cancellation kills the
+// whole tree, not just the direct child. Production wiring must hand the tools
+// a DockerSandbox bound to the flow's worker container.
 type LocalSandbox struct{}
 
 func (LocalSandbox) Exec(ctx context.Context, argv []string, opts ExecOptions) (ExecResult, error) {
@@ -68,6 +70,7 @@ func (LocalSandbox) Exec(ctx context.Context, argv []string, opts ExecOptions) (
 	}
 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	setPgid(cmd)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
 	}
@@ -114,9 +117,10 @@ func (m mobyExec) ContainerExecInspect(ctx context.Context, execID string) (clie
 	return m.cli.ExecInspect(ctx, execID, client.ExecInspectOptions{})
 }
 
-// DockerSandbox execs inside a running container. It does not wrap commands
-// with pkg/docker's flow markers: the spike has no per-task kill sweep to
-// integrate with yet.
+// DockerSandbox execs inside a running container. The exec wrapper records its
+// PID in a marker file so cancellation can kill the whole process group —
+// closing the attach stream only detaches the client, the command keeps
+// running in the container.
 type DockerSandbox struct {
 	Client    ExecDocker
 	Container string
@@ -140,8 +144,11 @@ func (s *DockerSandbox) Exec(ctx context.Context, argv []string, opts ExecOption
 		defer cancel()
 	}
 
+	marker := "/tmp/.adk-exec-" + uuid.NewString()
 	createResp, err := s.Client.ContainerExecCreate(ctx, s.Container, client.ExecCreateOptions{
-		Cmd:          argv,
+		Cmd: append([]string{
+			"sh", "-c", "echo $$ > " + marker + " 2>/dev/null || true; exec \"$@\"", "sh",
+		}, argv...),
 		AttachStdout: true,
 		AttachStderr: true,
 		WorkingDir:   opts.Cwd,
@@ -176,6 +183,9 @@ func (s *DockerSandbox) Exec(ctx context.Context, argv []string, opts ExecOption
 		// The copy goroutine exits on the closed connection; its error is
 		// expected here, only the partial output matters.
 		<-done
+		killCtx, killCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		s.killExec(killCtx, marker)
+		killCancel()
 		res.Output = out.buf.String()
 		res.TimedOut = true
 		res.Truncated = out.truncated
@@ -190,4 +200,24 @@ func (s *DockerSandbox) Exec(ctx context.Context, argv []string, opts ExecOption
 	}
 	res.ExitCode = inspect.ExitCode
 	return res, nil
+}
+
+// killExec is best-effort: group kill first (the exec'd process leads its own
+// group when a TTY is allocated), direct-PID kill as fallback, then the marker
+// is removed. The cleanup itself must not fail the call — the activity already
+// reports a timeout.
+func (s *DockerSandbox) killExec(ctx context.Context, marker string) {
+	script := fmt.Sprintf(
+		`kill -KILL -"$(cat %[1]s 2>/dev/null)" 2>/dev/null || kill -KILL "$(cat %[1]s 2>/dev/null)" 2>/dev/null; rm -f %[1]s`,
+		marker)
+	create, err := s.Client.ContainerExecCreate(ctx, s.Container, client.ExecCreateOptions{
+		Cmd: []string{"sh", "-c", script},
+	})
+	if err != nil {
+		return
+	}
+	resp, err := s.Client.ContainerExecAttach(ctx, create.ID, client.ExecAttachOptions{})
+	if err == nil {
+		resp.Close()
+	}
 }

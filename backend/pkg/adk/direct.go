@@ -20,7 +20,7 @@ func DirectTools(sb Sandbox, payload PayloadStore, threshold int) ([]tool.Tool, 
 
 	terminal, err := functiontool.New(functiontool.Config{
 		Name:        TerminalToolName,
-		Description: "Run a shell command in the assessment sandbox.",
+		Description: terminalToolDesc,
 	}, func(ctx agent.Context, in TerminalExecInput) (ToolResult, error) {
 		return acts.TerminalExec(ctx, in)
 	})
@@ -30,7 +30,7 @@ func DirectTools(sb Sandbox, payload PayloadStore, threshold int) ([]tool.Tool, 
 
 	nuclei, err := functiontool.New(functiontool.Config{
 		Name:        NucleiToolName,
-		Description: "Run a nuclei template scan against one target URL and return the JSONL findings.",
+		Description: nucleiToolDesc,
 	}, func(ctx agent.Context, in NucleiScanInput) (ToolResult, error) {
 		return acts.NucleiScan(ctx, in)
 	})
@@ -40,7 +40,7 @@ func DirectTools(sb Sandbox, payload PayloadStore, threshold int) ([]tool.Tool, 
 
 	httpx, err := functiontool.New(functiontool.Config{
 		Name:        HttpxToolName,
-		Description: "Probe a target URL with httpx and return the JSON probe result.",
+		Description: httpxToolDesc,
 	}, func(ctx agent.Context, in HttpxProbeInput) (ToolResult, error) {
 		return acts.HttpxProbe(ctx, in)
 	})
@@ -60,11 +60,11 @@ func RunDirect(ctx context.Context, cfg *Config, sb Sandbox, payload PayloadStor
 	if err != nil {
 		return PentestResult{}, fmt.Errorf("failed to build model: %w", err)
 	}
-	return runDirect(ctx, mdl, sb, payload, task, nil)
+	return runDirect(ctx, mdl, sb, payload, task, cfg.PayloadThreshold, nil)
 }
 
-func runDirect(ctx context.Context, mdl model.LLM, sb Sandbox, payload PayloadStore, task string, guard ScopeGuard) (PentestResult, error) {
-	tools, err := DirectTools(sb, payload, 16<<10)
+func runDirect(ctx context.Context, mdl model.LLM, sb Sandbox, payload PayloadStore, task string, threshold int, guard ScopeGuard) (PentestResult, error) {
+	tools, err := DirectTools(sb, payload, threshold)
 	if err != nil {
 		return PentestResult{}, err
 	}

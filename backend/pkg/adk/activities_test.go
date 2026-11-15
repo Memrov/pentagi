@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,12 +18,21 @@ import (
 // optsRecordingSandbox captures the ExecOptions each call ran under.
 type optsRecordingSandbox struct {
 	inner *fakeSandbox
-	seen  []ExecOptions
+	mu    sync.Mutex
+	opts  []ExecOptions
 }
 
 func (o *optsRecordingSandbox) Exec(ctx context.Context, argv []string, opts ExecOptions) (ExecResult, error) {
-	o.seen = append(o.seen, opts)
+	o.mu.Lock()
+	o.opts = append(o.opts, opts)
+	o.mu.Unlock()
 	return o.inner.Exec(ctx, argv, opts)
+}
+
+func (o *optsRecordingSandbox) seen() []ExecOptions {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]ExecOptions(nil), o.opts...)
 }
 
 func TestActivities_TerminalExec_ShellWrapsAndBoundsTimeout(t *testing.T) {
@@ -39,9 +49,10 @@ func TestActivities_TerminalExec_ShellWrapsAndBoundsTimeout(t *testing.T) {
 	calls := sb.calls()
 	require.Len(t, calls, 1)
 	assert.Equal(t, []string{"sh", "-c", "id"}, calls[0])
-	require.Len(t, rec.seen, 1)
-	assert.Equal(t, "/work", rec.seen[0].Cwd)
-	assert.Equal(t, 10*time.Second, rec.seen[0].Timeout)
+	seen := rec.seen()
+	require.Len(t, seen, 1)
+	assert.Equal(t, "/work", seen[0].Cwd)
+	assert.Equal(t, 10*time.Second, seen[0].Timeout)
 }
 
 func TestActivities_TerminalExec_RejectsEmptyCommandNonRetryable(t *testing.T) {

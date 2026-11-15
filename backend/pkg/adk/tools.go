@@ -54,11 +54,23 @@ var (
 	_ func(context.Context, HttpxProbeInput) (ToolResult, error)   = (*Activities)(nil).HttpxProbe
 )
 
+// Model-facing tool descriptions, shared by the durable and direct tool sets
+// so the A/B comparison exercises the same agent instructions.
+const (
+	terminalToolDesc = "Run a shell command in the assessment sandbox. Use for reconnaissance, " +
+		"exploitation steps, and general tooling that is not covered by the dedicated scanners."
+	nucleiToolDesc = "Run a nuclei template scan against one target URL and return the JSONL findings. " +
+		"Prefer severity and tags filters over broad scans."
+	httpxToolDesc = "Probe a target URL with httpx and return the JSON probe result " +
+		"(status, title, technologies, redirect chain)."
+)
+
 // DurableTools builds the workflow-side tool set: each tool call becomes a
 // Temporal activity dispatched under the same name it is registered with.
 func DurableTools(timeout time.Duration) ([]tool.Tool, error) {
 	actOpts := workflow.ActivityOptions{
 		StartToCloseTimeout: timeout,
+		HeartbeatTimeout:    toolHeartbeatTimeout,
 		RetryPolicy: &temporal.RetryPolicy{
 			InitialInterval:    2 * time.Second,
 			BackoffCoefficient: 2,
@@ -68,9 +80,8 @@ func DurableTools(timeout time.Duration) ([]tool.Tool, error) {
 	}
 
 	terminal, err := googleadk.ActivityAsTool(terminalExecShape, googleadk.ActivityToolOptions{
-		Name: TerminalToolName,
-		Description: "Run a shell command in the assessment sandbox. Use for reconnaissance, " +
-			"exploitation steps, and general tooling that is not covered by the dedicated scanners.",
+		Name:            TerminalToolName,
+		Description:     terminalToolDesc,
 		ActivityOptions: actOpts,
 	})
 	if err != nil {
@@ -78,9 +89,8 @@ func DurableTools(timeout time.Duration) ([]tool.Tool, error) {
 	}
 
 	nuclei, err := googleadk.ActivityAsTool(nucleiScanShape, googleadk.ActivityToolOptions{
-		Name: NucleiToolName,
-		Description: "Run a nuclei template scan against one target URL and return the JSONL findings. " +
-			"Prefer severity and tags filters over broad scans.",
+		Name:            NucleiToolName,
+		Description:     nucleiToolDesc,
 		ActivityOptions: actOpts,
 	})
 	if err != nil {
@@ -88,9 +98,8 @@ func DurableTools(timeout time.Duration) ([]tool.Tool, error) {
 	}
 
 	httpx, err := googleadk.ActivityAsTool(httpxProbeShape, googleadk.ActivityToolOptions{
-		Name: HttpxToolName,
-		Description: "Probe a target URL with httpx and return the JSON probe result " +
-			"(status, title, technologies, redirect chain).",
+		Name:            HttpxToolName,
+		Description:     httpxToolDesc,
 		ActivityOptions: actOpts,
 	})
 	if err != nil {
