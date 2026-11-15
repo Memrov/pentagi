@@ -2,7 +2,9 @@ package adk
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
@@ -10,13 +12,16 @@ import (
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/tool/functiontool"
+	"google.golang.org/adk/v2/tool/toolconfirmation"
 	"google.golang.org/genai"
 )
 
 // DirectTools builds the same three tools as in-process function tools, for
-// running the agent without Temporal; tool results are identical in shape.
-func DirectTools(sb Sandbox, payload PayloadStore, threshold int) ([]tool.Tool, error) {
-	acts := NewActivities(sb, payload, threshold, DefaultToolTimeout)
+// running the agent without Temporal; tool results are identical in shape, and
+// the timeout must match the durable path or the A/B comparison measures
+// different tool budgets.
+func DirectTools(sb Sandbox, payload PayloadStore, threshold int, toolTimeout time.Duration) ([]tool.Tool, error) {
+	acts := NewActivities(sb, payload, threshold, toolTimeout)
 
 	terminal, err := functiontool.New(functiontool.Config{
 		Name:        TerminalToolName,
@@ -56,19 +61,35 @@ func DirectTools(sb Sandbox, payload PayloadStore, threshold int) ([]tool.Tool, 
 // A tool confirmation pauses nothing here — pending requests surface as an
 // error since there is no signal to resume on.
 func RunDirect(ctx context.Context, cfg *Config, sb Sandbox, payload PayloadStore, task string) (PentestResult, error) {
+	if cfg.APIKey == "" {
+		return PentestResult{}, fmt.Errorf("ADK_API_KEY is required")
+	}
 	mdl, err := ModelFactory(cfg)(ctx, cfg.ModelName)
 	if err != nil {
 		return PentestResult{}, fmt.Errorf("failed to build model: %w", err)
 	}
-	return runDirect(ctx, mdl, sb, payload, task, cfg.PayloadThreshold, nil)
+	return runDirect(ctx, mdl, task, directOptions{
+		sb:          sb,
+		payload:     payload,
+		threshold:   cfg.PayloadThreshold,
+		toolTimeout: cfg.ToolTimeout(),
+	})
 }
 
-func runDirect(ctx context.Context, mdl model.LLM, sb Sandbox, payload PayloadStore, task string, threshold int, guard ScopeGuard) (PentestResult, error) {
-	tools, err := DirectTools(sb, payload, threshold)
+type directOptions struct {
+	sb          Sandbox
+	payload     PayloadStore
+	threshold   int
+	toolTimeout time.Duration
+	guard       ScopeGuard
+}
+
+func runDirect(ctx context.Context, mdl model.LLM, task string, opts directOptions) (PentestResult, error) {
+	tools, err := DirectTools(opts.sb, opts.payload, opts.threshold, opts.toolTimeout)
 	if err != nil {
 		return PentestResult{}, err
 	}
-	pentester, err := NewPentesterAgent(mdl, tools, guard)
+	pentester, err := NewPentesterAgent(mdl, tools, opts.guard)
 	if err != nil {
 		return PentestResult{}, err
 	}
@@ -91,7 +112,7 @@ func runDirect(ctx context.Context, mdl model.LLM, sb Sandbox, payload PayloadSt
 		if ev == nil {
 			continue
 		}
-		res.Events++
+		res.EventCount++
 		if ev.Content == nil {
 			continue
 		}
@@ -100,8 +121,8 @@ func runDirect(ctx context.Context, mdl model.LLM, sb Sandbox, payload PayloadSt
 				if p.Text != "" {
 					res.Answer = p.Text
 				}
-				if p.FunctionCall != nil && p.FunctionCall.Name == "adk_request_confirmation" {
-					return res, fmt.Errorf("tool requested confirmation, which direct mode cannot answer")
+				if p.FunctionCall != nil && p.FunctionCall.Name == toolconfirmation.FunctionCallName {
+					return res, errors.New("tool requested confirmation, which direct mode cannot answer")
 				}
 			}
 		}

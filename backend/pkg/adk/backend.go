@@ -6,16 +6,45 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/moby/moby/client"
+	"go.temporal.io/sdk/activity"
 )
 
 // maxExecOutput bounds captured command output; anything past it is discarded
 // and marked truncated rather than growing the activity result unboundedly.
 const maxExecOutput = 4 << 20 // 4 MiB
+
+// dockerJoinTimeout bounds the wait for the copy goroutine once the hijacked
+// stream is closed; a stuck copy must not deadlock the activity.
+const dockerJoinTimeout = 5 * time.Second
+
+// errToolTimeout distinguishes the tool's own deadline from a parent cancel:
+// only the former produces the graceful TimedOut result.
+var errToolTimeout = errors.New("tool timeout")
+
+// Spawned tools see only what they need. The worker's environment carries the
+// model and Temporal credentials, and an inherited env would let any spawned
+// command read them back into workflow history.
+var sandboxAllowEnv = []string{"PATH=", "HOME=", "LANG=", "LC_ALL=", "TERM=", "TMPDIR=", "USER=", "SHELL="}
+
+func sandboxEnv() []string {
+	env := make([]string, 0, len(sandboxAllowEnv))
+	for _, e := range os.Environ() {
+		for _, p := range sandboxAllowEnv {
+			if strings.HasPrefix(e, p) {
+				env = append(env, e)
+				break
+			}
+		}
+	}
+	return env
+}
 
 type ExecOptions struct {
 	Cwd     string
@@ -43,11 +72,9 @@ type cappedBuffer struct {
 }
 
 func (b *cappedBuffer) Write(p []byte) (int, error) {
-	if b.buf.Len() < b.limit {
-		n := min(len(p), b.limit-b.buf.Len())
-		_, _ = b.buf.Write(p[:n])
-	}
-	if len(p) > 0 && b.buf.Len() == b.limit {
+	n := min(len(p), b.limit-b.buf.Len())
+	_, _ = b.buf.Write(p[:n])
+	if n < len(p) {
 		b.truncated = true
 	}
 	return len(p), nil
@@ -61,15 +88,17 @@ type LocalSandbox struct{}
 
 func (LocalSandbox) Exec(ctx context.Context, argv []string, opts ExecOptions) (ExecResult, error) {
 	if len(argv) == 0 {
-		return ExecResult{}, fmt.Errorf("empty argv")
+		return ExecResult{}, nonRetryable("empty argv")
 	}
+	execCtx := ctx
 	if opts.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
+		execCtx, cancel = context.WithTimeoutCause(ctx, opts.Timeout, errToolTimeout)
 		defer cancel()
 	}
 
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd := exec.CommandContext(execCtx, argv[0], argv[1:]...)
+	cmd.Env = sandboxEnv()
 	setPgid(cmd)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -83,20 +112,26 @@ func (LocalSandbox) Exec(ctx context.Context, argv []string, opts ExecOptions) (
 	if cmd.ProcessState != nil {
 		res.ExitCode = cmd.ProcessState.ExitCode()
 	}
-	if ctx.Err() != nil {
-		res.TimedOut = true
-		return res, nil
+	if err := context.Cause(execCtx); err != nil {
+		if errors.Is(err, errToolTimeout) {
+			res.TimedOut = true
+			return res, nil
+		}
+		return res, ctx.Err()
 	}
 	var exitErr *exec.ExitError
 	if err != nil && !errors.As(err, &exitErr) {
+		if errors.Is(err, exec.ErrNotFound) {
+			return res, nonRetryable("executable not found: %s", argv[0])
+		}
 		return res, fmt.Errorf("failed to run %q: %w", argv[0], err)
 	}
 	return res, nil
 }
 
-// ExecDocker is the exec slice of docker.DockerClient, so the PentAGI client
+// DockerExecClient is the exec slice of docker.DockerClient, so the PentAGI client
 // satisfies it; mobyExec adapts the bare moby client to the same shape.
-type ExecDocker interface {
+type DockerExecClient interface {
 	ContainerExecCreate(ctx context.Context, container string, config client.ExecCreateOptions) (client.ExecCreateResult, error)
 	ContainerExecAttach(ctx context.Context, execID string, config client.ExecAttachOptions) (client.HijackedResponse, error)
 	ContainerExecInspect(ctx context.Context, execID string) (client.ExecInspectResult, error)
@@ -122,7 +157,7 @@ func (m mobyExec) ContainerExecInspect(ctx context.Context, execID string) (clie
 // closing the attach stream only detaches the client, the command keeps
 // running in the container.
 type DockerSandbox struct {
-	Client    ExecDocker
+	Client    DockerExecClient
 	Container string
 }
 
@@ -136,16 +171,20 @@ func NewDockerSandbox(container string) (*DockerSandbox, error) {
 
 func (s *DockerSandbox) Exec(ctx context.Context, argv []string, opts ExecOptions) (ExecResult, error) {
 	if len(argv) == 0 {
-		return ExecResult{}, fmt.Errorf("empty argv")
+		return ExecResult{}, nonRetryable("empty argv")
 	}
+	if s.Client == nil || s.Container == "" {
+		return ExecResult{}, nonRetryable("docker sandbox requires a client and container")
+	}
+	execCtx := ctx
 	if opts.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
+		execCtx, cancel = context.WithTimeoutCause(ctx, opts.Timeout, errToolTimeout)
 		defer cancel()
 	}
 
 	marker := "/tmp/.adk-exec-" + uuid.NewString()
-	createResp, err := s.Client.ContainerExecCreate(ctx, s.Container, client.ExecCreateOptions{
+	createResp, err := s.Client.ContainerExecCreate(execCtx, s.Container, client.ExecCreateOptions{
 		Cmd: append([]string{
 			"sh", "-c", "echo $$ > " + marker + " 2>/dev/null || true; exec \"$@\"", "sh",
 		}, argv...),
@@ -158,7 +197,7 @@ func (s *DockerSandbox) Exec(ctx context.Context, argv []string, opts ExecOption
 		return ExecResult{}, fmt.Errorf("failed to create exec process: %w", err)
 	}
 
-	resp, err := s.Client.ContainerExecAttach(ctx, createResp.ID, client.ExecAttachOptions{TTY: true})
+	resp, err := s.Client.ContainerExecAttach(execCtx, createResp.ID, client.ExecAttachOptions{TTY: true})
 	if err != nil {
 		return ExecResult{}, fmt.Errorf("failed to attach to exec process: %w", err)
 	}
@@ -175,26 +214,36 @@ func (s *DockerSandbox) Exec(ctx context.Context, argv []string, opts ExecOption
 	res := ExecResult{ExitCode: -1}
 	select {
 	case <-done:
-		if copyErr != nil && copyErr != io.EOF {
+		if copyErr != nil && !errors.Is(copyErr, io.EOF) {
 			return res, fmt.Errorf("failed to copy output: %w", copyErr)
 		}
-	case <-ctx.Done():
+		if ctx.Err() != nil {
+			return res, ctx.Err()
+		}
+	case <-execCtx.Done():
 		resp.Close()
 		// The copy goroutine exits on the closed connection; its error is
 		// expected here, only the partial output matters.
-		<-done
+		select {
+		case <-done:
+		case <-time.After(dockerJoinTimeout):
+			logActivity(ctx).Warn("docker output copy did not stop after stream close")
+		}
 		killCtx, killCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		s.killExec(killCtx, marker)
 		killCancel()
 		res.Output = out.buf.String()
-		res.TimedOut = true
 		res.Truncated = out.truncated
+		if !errors.Is(context.Cause(execCtx), errToolTimeout) {
+			return res, ctx.Err()
+		}
+		res.TimedOut = true
 		return res, nil
 	}
 
 	res.Output = out.buf.String()
 	res.Truncated = out.truncated
-	inspect, err := s.Client.ContainerExecInspect(ctx, createResp.ID)
+	inspect, err := s.Client.ContainerExecInspect(execCtx, createResp.ID)
 	if err != nil {
 		return res, fmt.Errorf("failed to inspect exec process: %w", err)
 	}
@@ -214,10 +263,29 @@ func (s *DockerSandbox) killExec(ctx context.Context, marker string) {
 		Cmd: []string{"sh", "-c", script},
 	})
 	if err != nil {
+		logActivity(ctx).Warn("docker cleanup exec create failed", "error", err)
 		return
 	}
 	resp, err := s.Client.ContainerExecAttach(ctx, create.ID, client.ExecAttachOptions{})
-	if err == nil {
-		resp.Close()
+	if err != nil {
+		logActivity(ctx).Warn("docker cleanup exec attach failed", "error", err)
+		return
 	}
+	resp.Close()
 }
+
+// logActivity returns the activity logger inside an activity and a discard
+// logger everywhere else, so sandbox cleanup failures surface where a Temporal
+// UI can show them without threading a logger through the API.
+func logActivity(ctx context.Context) interface {
+	Warn(msg string, keyvals ...interface{})
+} {
+	if activity.IsActivity(ctx) {
+		return activity.GetLogger(ctx)
+	}
+	return discardLogger{}
+}
+
+type discardLogger struct{}
+
+func (discardLogger) Warn(string, ...interface{}) {}

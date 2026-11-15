@@ -35,13 +35,51 @@ func TestConfig_LoadConfig_Defaults(t *testing.T) {
 	assert.Equal(t, "pentagi-adk", cfg.TaskQueue)
 }
 
-func TestConfig_Validate_RequiresAPIKey(t *testing.T) {
-	cfg := &Config{Sandbox: "local", PayloadThreshold: 1}
-	assert.ErrorContains(t, cfg.Validate(), "ADK_API_KEY")
+func TestConfig_Validate_RejectsInvalidFields(t *testing.T) {
+	valid := func() *Config {
+		return &Config{
+			Sandbox: "local", PayloadThreshold: 1, ToolTimeoutSeconds: 60,
+			ModelName: "m", ModelAPI: "chat_completions", BaseURL: "https://x.test",
+		}
+	}
+	cases := []struct {
+		name string
+		mut  func(*Config)
+		want string
+	}{
+		{"bad sandbox", func(c *Config) { c.Sandbox = "podman" }, "ADK_SANDBOX"},
+		{"docker without container", func(c *Config) {
+			c.Sandbox = "docker"
+		}, "ADK_SANDBOX_CONTAINER"},
+		{"no payload threshold", func(c *Config) { c.PayloadThreshold = 0 }, "ADK_PAYLOAD_THRESHOLD"},
+		{"no tool timeout", func(c *Config) { c.ToolTimeoutSeconds = 0 }, "ADK_TOOL_TIMEOUT"},
+		{"no model name", func(c *Config) { c.ModelName = "" }, "ADK_MODEL_NAME"},
+		{"bad model api", func(c *Config) { c.ModelAPI = "chat" }, "ADK_MODEL_API"},
+		{"plaintext base url", func(c *Config) { c.BaseURL = "http://api.example.com" }, "ADK_BASE_URL"},
+		{"unparseable base url", func(c *Config) { c.BaseURL = "not a url" }, "ADK_BASE_URL"},
+		// The key is checked where the model is built, not here.
+		{"api key not required", func(c *Config) { c.APIKey = "" }, ""},
+		{"localhost http allowed", func(c *Config) { c.BaseURL = "http://localhost:8080" }, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := valid()
+			tc.mut(cfg)
+			err := cfg.Validate()
+			if tc.want == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.want)
+		})
+	}
 }
 
 func TestConfig_Validate_DockerRequiresContainer(t *testing.T) {
-	cfg := &Config{APIKey: "k", Sandbox: "docker", PayloadThreshold: 1, ModelAPI: "chat_completions"}
+	cfg := &Config{
+		Sandbox: "docker", PayloadThreshold: 1, ToolTimeoutSeconds: 60,
+		ModelName: "m", ModelAPI: "chat_completions", BaseURL: "https://x.test",
+	}
 	assert.ErrorContains(t, cfg.Validate(), "ADK_SANDBOX_CONTAINER")
 
 	cfg.SandboxContainer = "sandbox-1"

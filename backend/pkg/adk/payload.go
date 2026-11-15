@@ -21,11 +21,16 @@ type PayloadStore interface {
 	Put(ctx context.Context, key string, data []byte) (uri string, err error)
 }
 
-// MemoryPayloadStore is the in-process store for tests and development; its
-// blobs die with the worker, so its URIs are only meaningful while it lives.
+// MemoryPayloadStore is the in-process fallback when no bucket is configured;
+// its blobs die with the worker, so its URIs are only meaningful while it
+// lives. Entries are bounded so an output-heavy run cannot grow memory
+// unboundedly — oldest keys are evicted FIFO.
+const maxMemoryPayloads = 32
+
 type MemoryPayloadStore struct {
 	mu    sync.Mutex
 	blobs map[string][]byte
+	order []string
 }
 
 func NewMemoryPayloadStore() *MemoryPayloadStore {
@@ -35,7 +40,17 @@ func NewMemoryPayloadStore() *MemoryPayloadStore {
 func (s *MemoryPayloadStore) Put(_ context.Context, key string, data []byte) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.blobs[key] = data
+	if s.blobs == nil {
+		s.blobs = map[string][]byte{}
+	}
+	if _, exists := s.blobs[key]; !exists {
+		s.order = append(s.order, key)
+		for len(s.order) > maxMemoryPayloads {
+			delete(s.blobs, s.order[0])
+			s.order = s.order[1:]
+		}
+	}
+	s.blobs[key] = slices.Clone(data)
 	return "mem://" + key, nil
 }
 

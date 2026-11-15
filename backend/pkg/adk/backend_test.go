@@ -20,9 +20,19 @@ func TestLocalSandbox_Exec_CapturesOutputAndExitCode(t *testing.T) {
 
 func TestLocalSandbox_Exec_KillsOnTimeout(t *testing.T) {
 	ctx := context.Background()
+	start := time.Now()
 	res, err := LocalSandbox{}.Exec(ctx, []string{"sleep", "30"}, ExecOptions{Timeout: 100 * time.Millisecond})
 	require.NoError(t, err)
 	assert.True(t, res.TimedOut)
+	assert.Less(t, time.Since(start), 5*time.Second, "the kill path must not wait out the command")
+}
+
+func TestLocalSandbox_Exec_PropagatesParentCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	res, err := LocalSandbox{}.Exec(ctx, []string{"sleep", "30"}, ExecOptions{Timeout: 30 * time.Second})
+	require.ErrorIs(t, err, context.Canceled)
+	assert.False(t, res.TimedOut, "parent cancellation is not the tool's own timeout")
 }
 
 func TestLocalSandbox_Exec_ErrorsOnlyOnSpawnFailure(t *testing.T) {
@@ -45,6 +55,10 @@ func TestCappedBuffer_Write_DropsPastLimit(t *testing.T) {
 	b2 := &cappedBuffer{limit: 5}
 	_, _ = b2.Write([]byte("hi"))
 	assert.False(t, b2.truncated)
+
+	b3 := &cappedBuffer{limit: 5}
+	_, _ = b3.Write([]byte("hello"))
+	assert.False(t, b3.truncated, "a write that fills the buffer exactly drops nothing")
 }
 
 func TestLocalSandbox_Exec_TruncatesHugeOutput(t *testing.T) {

@@ -21,7 +21,9 @@ func TestRunDirect_ToolCallThenAnswer(t *testing.T) {
 		return ExecResult{Output: "recon\n", ExitCode: 0}, nil
 	}}
 
-	res, err := runDirect(context.Background(), fm, sb, nil, "do recon", 1024, nil)
+	res, err := runDirect(context.Background(), fm, "do recon", directOptions{
+		sb: sb, threshold: 1024, toolTimeout: DefaultToolTimeout,
+	})
 	require.NoError(t, err)
 	assert.Equal(t, "recon says hi", res.Answer)
 
@@ -47,7 +49,9 @@ func TestRunDirect_ScopeGuardShortCircuitsTool(t *testing.T) {
 		return nil, nil
 	})
 
-	res, err := runDirect(context.Background(), fm, sb, nil, "scan", 1024, guard)
+	res, err := runDirect(context.Background(), fm, "scan", directOptions{
+		sb: sb, threshold: 1024, toolTimeout: DefaultToolTimeout, guard: guard,
+	})
 	require.NoError(t, err)
 	assert.Equal(t, "call was blocked", res.Answer)
 	assert.Empty(t, sb.calls(), "the guard must run before the sandbox")

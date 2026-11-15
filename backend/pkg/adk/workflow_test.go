@@ -99,9 +99,7 @@ func TestPentesterWorkflow_ToolCallThenAnswer(t *testing.T) {
 
 func TestPentesterWorkflow_MultiToolSequence(t *testing.T) {
 	const modelName = "fake-model"
-	var ran [][]string
 	sb := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
-		ran = append(ran, argv)
 		return ExecResult{Output: `{"host":"scanme.sh","status":200}`, ExitCode: 0}, nil
 	}}
 	env, counter := newPentestEnv(t, modelName, []*model.LLMResponse{
@@ -115,9 +113,10 @@ func TestPentesterWorkflow_MultiToolSequence(t *testing.T) {
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())
 
-	require.Len(t, ran, 2)
-	assert.Equal(t, "httpx", ran[0][0])
-	assert.Equal(t, "nuclei", ran[1][0])
+	calls := sb.calls()
+	require.Len(t, calls, 2)
+	assert.Equal(t, "httpx", calls[0][0])
+	assert.Equal(t, "nuclei", calls[1][0])
 	assert.Equal(t, 1, counter.get(HttpxToolName))
 	assert.Equal(t, 1, counter.get(NucleiToolName))
 	assert.Equal(t, 3, counter.get(googleadk.InvokeModelActivityName))

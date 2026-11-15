@@ -17,7 +17,10 @@ type fakeSandbox struct {
 	called chan struct{}
 }
 
-func (f *fakeSandbox) Exec(_ context.Context, argv []string, _ ExecOptions) (ExecResult, error) {
+func (f *fakeSandbox) Exec(ctx context.Context, argv []string, _ ExecOptions) (ExecResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ExecResult{}, err
+	}
 	f.mu.Lock()
 	f.argv = append(f.argv, append([]string(nil), argv...))
 	next := f.next

@@ -2,19 +2,16 @@ package adk
 
 import (
 	"fmt"
+	"net/url"
 	"time"
 
 	"github.com/caarlos0/env/v10"
 	"google.golang.org/adk/v2/model/openaimodel"
 )
 
-const (
-	// DefaultBaseURL is OpenCode Go's OpenAI-compatible base; /chat/completions
-	// or /responses is appended by the client. Console translates every text
-	// model across APIs, so the chat-completions path serves all of them.
-	DefaultBaseURL   = "https://opencode.ai/inference/go/openai/v1"
-	DefaultModelName = "deepseek-v4.1-flash"
-)
+// DefaultModelName is the fallback when a request names no model; the
+// canonical BaseURL default lives in the envDefault tag on Config.BaseURL.
+const DefaultModelName = "deepseek-v4.1-flash"
 
 // Config carries the spike's own environment; Temporal connection settings stay
 // in pkg/config and are composed by the caller. The API key must only ever come
@@ -49,9 +46,8 @@ func LoadConfig() (*Config, error) {
 }
 
 func (c *Config) Validate() error {
-	if c.APIKey == "" {
-		return fmt.Errorf("ADK_API_KEY is required")
-	}
+	// APIKey is deliberately not required here — `run` never builds a model;
+	// WorkerPlugin and RunDirect check it at the point the model is built.
 	switch c.Sandbox {
 	case "local", "docker":
 	default:
@@ -63,13 +59,38 @@ func (c *Config) Validate() error {
 	if c.PayloadThreshold <= 0 {
 		return fmt.Errorf("ADK_PAYLOAD_THRESHOLD must be positive, got %d", c.PayloadThreshold)
 	}
+	if c.ToolTimeoutSeconds <= 0 {
+		return fmt.Errorf("ADK_TOOL_TIMEOUT must be positive, got %d", c.ToolTimeoutSeconds)
+	}
+	if c.ModelName == "" {
+		return fmt.Errorf("ADK_MODEL_NAME is required")
+	}
 	switch openaimodel.API(c.ModelAPI) {
 	case openaimodel.APIChatCompletions, openaimodel.APIResponses:
 	default:
 		return fmt.Errorf("ADK_MODEL_API must be %s or %s, got %q",
 			openaimodel.APIChatCompletions, openaimodel.APIResponses, c.ModelAPI)
 	}
+	if u, err := url.Parse(c.BaseURL); err != nil || !isSecureOrLocal(u) {
+		return fmt.Errorf("ADK_BASE_URL must be an https URL (http allowed only for localhost), got %q", c.BaseURL)
+	}
 	return nil
+}
+
+// The API key is sent as a bearer token to BaseURL, so anything but https —
+// or a non-parseable value — would ship it in cleartext.
+func isSecureOrLocal(u *url.URL) bool {
+	if u.Scheme == "https" {
+		return true
+	}
+	if u.Scheme != "http" {
+		return false
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
 }
 
 func (c *Config) ToolTimeout() time.Duration {

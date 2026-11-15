@@ -1,9 +1,11 @@
 package adk
 
 import (
+	"cmp"
 	"time"
 
 	"go.temporal.io/googleadk"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/runner"
@@ -21,8 +23,23 @@ type PentestRequest struct {
 }
 
 type PentestResult struct {
-	Answer string `json:"answer"`
-	Events int    `json:"events"`
+	Answer     string `json:"answer"`
+	EventCount int    `json:"event_count"`
+}
+
+// modelActivityOptions bounds InvokeModel the way tools are bounded: a
+// heartbeat timeout (the plugin heartbeats on a timer once it is set) and a
+// bounded retry, so a wedged model call is detected and a persistent provider
+// failure fails the workflow instead of retrying forever.
+var modelActivityOptions = workflow.ActivityOptions{
+	StartToCloseTimeout: 10 * time.Minute,
+	HeartbeatTimeout:    30 * time.Second,
+	RetryPolicy: &temporal.RetryPolicy{
+		InitialInterval:    time.Second,
+		BackoffCoefficient: 2,
+		MaximumInterval:    time.Minute,
+		MaximumAttempts:    3,
+	},
 }
 
 // PentesterWorkflow drives the ADK pentester for one task. Each pass over
@@ -31,7 +48,7 @@ type PentestResult struct {
 // before resuming, so a confirmation can sit outstanding across restarts.
 func PentesterWorkflow(ctx workflow.Context, req PentestRequest) (PentestResult, error) {
 	toolTimeout := DefaultToolTimeout
-	if req.ToolTimeoutSeconds > 0 {
+	if req.ToolTimeoutSeconds > 0 && req.ToolTimeoutSeconds <= int((24*time.Hour)/time.Second) {
 		toolTimeout = time.Duration(req.ToolTimeoutSeconds) * time.Second
 	}
 
@@ -40,11 +57,9 @@ func PentesterWorkflow(ctx workflow.Context, req PentestRequest) (PentestResult,
 		return PentestResult{}, err
 	}
 
-	modelName := req.Model
-	if modelName == "" {
-		modelName = DefaultModelName
-	}
-	pentester, err := NewPentesterAgent(googleadk.NewModel(modelName), tools, nil)
+	modelName := cmp.Or(req.Model, DefaultModelName)
+	pentester, err := NewPentesterAgent(googleadk.NewModel(modelName,
+		googleadk.WithModelActivityOptions(modelActivityOptions)), tools, nil)
 	if err != nil {
 		return PentestResult{}, err
 	}
@@ -59,14 +74,8 @@ func PentesterWorkflow(ctx workflow.Context, req PentestRequest) (PentestResult,
 		return PentestResult{}, err
 	}
 
-	userID := req.UserID
-	if userID == "" {
-		userID = "pentagi"
-	}
-	sessionID := req.SessionID
-	if sessionID == "" {
-		sessionID = workflow.GetInfo(ctx).WorkflowExecution.ID
-	}
+	userID := cmp.Or(req.UserID, "pentagi")
+	sessionID := cmp.Or(req.SessionID, workflow.GetInfo(ctx).WorkflowExecution.ID)
 
 	adkCtx := googleadk.NewContext(ctx)
 	msg := genai.NewContentFromText(req.Task, genai.RoleUser)
@@ -82,7 +91,7 @@ func PentesterWorkflow(ctx workflow.Context, req PentestRequest) (PentestResult,
 				continue
 			}
 			events = append(events, ev)
-			res.Events++
+			res.EventCount++
 			if ev.Content == nil {
 				continue
 			}

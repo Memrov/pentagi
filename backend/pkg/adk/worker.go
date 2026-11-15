@@ -12,8 +12,12 @@ import (
 
 // WorkerPlugin registers the integration's InvokeModel activity (and the MCP
 // activities) at worker start, with our openai-compatible model behind the
-// activity boundary.
+// activity boundary. The key is checked here rather than in Config.Validate so
+// commands that never build a model ("run", "help") do not require it.
 func WorkerPlugin(cfg *Config) (worker.Plugin, error) {
+	if cfg.APIKey == "" {
+		return nil, fmt.Errorf("ADK_API_KEY is required")
+	}
 	return googleadk.NewPlugin(googleadk.Config{
 		Models: map[string]googleadk.ModelFactory{
 			cfg.ModelName: ModelFactory(cfg),
