@@ -892,7 +892,11 @@ func (s *AuthService) Info(c *gin.Context) {
 		return
 	}
 
-	logger.FromContext(c).WithFields(logrus.Fields(c.Keys)).Trace("AuthService.Info")
+	fields := make(logrus.Fields, len(c.Keys))
+	for k, v := range c.Keys {
+		fields[fmt.Sprint(k)] = v
+	}
+	logger.FromContext(c).WithFields(fields).Trace("AuthService.Info")
 	now := time.Now().Unix()
 	uhash := c.GetString("uhash")
 	uid := c.GetUint64("uid")
