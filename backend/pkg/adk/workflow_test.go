@@ -2,6 +2,7 @@ package adk
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -209,4 +210,110 @@ func TestPentesterWorkflow_ToolValidationErrorFeedsBackOnce(t *testing.T) {
 	assert.Contains(t, res.Answer, "http(s) scheme")
 	assert.Equal(t, 1, counter.get(NucleiToolName), "non-retryable means a single attempt")
 	assert.Equal(t, 2, counter.get(googleadk.InvokeModelActivityName))
+}
+
+// emitCapture stands in for EmitFlowEventActivity: the ops the workflow
+// translated land here exactly once per session event.
+type emitCapture struct {
+	mu     sync.Mutex
+	inputs []EmitFlowEventInput
+	err    error
+}
+
+func (c *emitCapture) emit(_ context.Context, in EmitFlowEventInput) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.inputs = append(c.inputs, in)
+	return c.err
+}
+
+func (c *emitCapture) all() []EmitFlowEventInput {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]EmitFlowEventInput(nil), c.inputs...)
+}
+
+func TestPentesterWorkflow_EmitEventsTranslatesEverySessionEvent(t *testing.T) {
+	const modelName = "fake-model"
+	sb := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
+		return ExecResult{Output: "uid=0", ExitCode: 0}, nil
+	}}
+	env, _ := newFakePentestEnv(t, modelName, []*model.LLMResponse{
+		googleadk.FunctionCallResponse("call-1", TerminalToolName, map[string]any{
+			"input": "id", "cwd": "/work", "detach": false, "timeout": 60, "message": "whoami",
+		}),
+		googleadk.FunctionCallResponse("call-2", HackResultToolName, map[string]any{
+			"success": true, "result": "root flag", "message": "pwned"}),
+	}, sb, nil)
+
+	capture := &emitCapture{}
+	env.RegisterActivityWithOptions(capture.emit, activity.RegisterOptions{Name: EmitFlowEventActivity})
+
+	env.ExecuteWorkflow(PentesterWorkflow, PentestRequest{
+		Task: "get root", Model: modelName,
+		FlowID: 7, EmitEvents: true, EmitTaskQueue: "flows-queue",
+	})
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+
+	inputs := capture.all()
+	var ops []FlowEvent
+	for _, in := range inputs {
+		assert.Equal(t, int64(7), in.FlowID)
+		ops = append(ops, in.Events...)
+	}
+
+	var starts, ends, dones int
+	for _, op := range ops {
+		switch {
+		case op.Op == FlowEventToolCallStart:
+			starts++
+		case op.Op == FlowEventToolCallEnd:
+			ends++
+		case op.Op == FlowEventMessage && op.Kind == MessageKindDone:
+			dones++
+		}
+	}
+	assert.Equal(t, 2, starts, "terminal and hack_result calls")
+	assert.Equal(t, 2, ends, "each call's response closes it")
+	assert.Equal(t, 1, dones, "hack_result emits the closing message")
+	assert.Equal(t, 4, len(inputs), "one emit activity per session event")
+}
+
+func TestPentesterWorkflow_EmitFailureDoesNotFailTheRun(t *testing.T) {
+	const modelName = "fake-model"
+	env, _ := newFakePentestEnv(t, modelName, []*model.LLMResponse{
+		googleadk.TextResponse("scan finished"),
+	}, &fakeSandbox{}, nil)
+
+	capture := &emitCapture{err: errors.New("flows worker gone")}
+	env.RegisterActivityWithOptions(capture.emit, activity.RegisterOptions{Name: EmitFlowEventActivity})
+
+	env.ExecuteWorkflow(PentesterWorkflow, PentestRequest{
+		Task: "scan", Model: modelName,
+		FlowID: 7, EmitEvents: true, EmitTaskQueue: "flows-queue",
+	})
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+
+	var res PentestResult
+	require.NoError(t, env.GetWorkflowResult(&res))
+	assert.Equal(t, "scan finished", res.Answer)
+	assert.NotEmpty(t, capture.all(), "the emit was still attempted")
+}
+
+func TestPentesterWorkflow_EmitEventsOffByDefault(t *testing.T) {
+	const modelName = "fake-model"
+	env, _ := newFakePentestEnv(t, modelName, []*model.LLMResponse{
+		googleadk.TextResponse("quiet run"),
+	}, &fakeSandbox{}, nil)
+
+	// No EmitFlowEvent registration at all: a CLI-style run must not reach for
+	// the flows queue — an unexpected lookup fails the workflow if it fires.
+	env.ExecuteWorkflow(PentesterWorkflow, PentestRequest{Task: "scan", Model: modelName})
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
 }

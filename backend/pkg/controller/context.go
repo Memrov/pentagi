@@ -31,9 +31,10 @@ type FlowContext struct {
 	Provider  providers.FlowProvider
 	Publisher subscriptions.FlowPublisher
 
-	TermLog    FlowTermLogWorker
-	MsgLog     FlowMsgLogWorker
-	Screenshot FlowScreenshotWorker
+	TermLog     FlowTermLogWorker
+	MsgLog      FlowMsgLogWorker
+	ToolCallLog FlowToolCallLogWorker
+	Screenshot  FlowScreenshotWorker
 }
 
 type TaskContext struct {

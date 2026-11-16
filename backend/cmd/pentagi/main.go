@@ -268,7 +268,7 @@ func main() {
 			// A warning rather than fatal: Temporal deployments without ADK_*
 			// envs must still boot, and a missing worker leaves engine=adk
 			// inputs dropped with an error in the workflow log.
-			if err := startADKWorker(durable, queries, cfg); err != nil {
+			if err := startADKWorker(durable, flowController, queries, cfg); err != nil {
 				logrus.WithError(err).Warn("ADK worker disabled")
 			}
 		}
@@ -326,7 +326,7 @@ func main() {
 // behind the plugin. The dispatch policy is published only once the worker
 // can actually serve the queue, so a misconfigured ADK setup drops inputs
 // with a workflow error instead of parking them on a queue nobody polls.
-func startADKWorker(durable *temporal.Client, queries *database.Queries, cfg *config.Config) error {
+func startADKWorker(durable *temporal.Client, flowController controller.FlowController, queries *database.Queries, cfg *config.Config) error {
 	adkCfg, err := adk.LoadConfig()
 	if err != nil {
 		return err
@@ -358,6 +358,7 @@ func startADKWorker(durable *temporal.Client, queries *database.Queries, cfg *co
 	acts := adk.NewActivities(sandbox, payload, adkCfg.PayloadThreshold, adkCfg.ToolTimeout())
 	acts.FlowBound = adkCfg.FlowBound
 	acts.SandboxFor = resolver
+	acts.TermLogFor = controller.NewADKTermLogResolver(flowController)
 
 	durable.SetADKPolicy(temporal.ADKPolicy{
 		TaskQueue:          cfg.ScopedName(adkCfg.TaskQueue),

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"time"
 
+	"pentagi/pkg/adk"
+
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 )
@@ -12,6 +14,7 @@ import (
 type Activities struct {
 	runner    FlowRunner
 	prompter  AgentPrompter
+	eventer   FlowEventer
 	heartbeat time.Duration
 }
 
@@ -63,6 +66,20 @@ func (a *Activities) RenderAgentPrompt(ctx context.Context, req PromptRenderRequ
 		return RenderedPrompt{}, temporal.NewNonRetryableApplicationError(err.Error(), "RenderFailed", err)
 	}
 	return res, nil
+}
+
+// EmitFlowEvent lands the child's translated session events on the flow's log
+// workers. It lives on the flows queue because the sink it calls is in-memory
+// per loaded flow; the child schedules it there via PentestRequest's emit
+// task queue. A missing eventer is non-retryable — the workflow treats emit
+// failures as observability loss and moves on, so parking the run on a worker
+// that can never persist buys nothing.
+func (a *Activities) EmitFlowEvent(ctx context.Context, in adk.EmitFlowEventInput) error {
+	if a.eventer == nil {
+		return temporal.NewNonRetryableApplicationError(
+			"no flow eventer registered on the flows worker", "EmitUnavailable", nil)
+	}
+	return a.eventer.EmitFlowEvent(ctx, in)
 }
 
 func (a *Activities) keepAlive(ctx context.Context, details any) (stop func()) {

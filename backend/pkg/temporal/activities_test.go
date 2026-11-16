@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"pentagi/pkg/adk"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/activity"
@@ -112,4 +114,46 @@ func TestActivities_ResumeFlow_PassesFlowID(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, []int64{3}, runner.resumed)
+}
+
+type fakeEventer struct {
+	err    error
+	inputs []adk.EmitFlowEventInput
+}
+
+func (e *fakeEventer) EmitFlowEvent(_ context.Context, in adk.EmitFlowEventInput) error {
+	e.inputs = append(e.inputs, in)
+	return e.err
+}
+
+func TestActivities_EmitFlowEvent_DelegatesToEventer(t *testing.T) {
+	eventer := &fakeEventer{}
+	acts := NewActivities(&fakeRunner{}, time.Second)
+	acts.eventer = eventer
+
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivityWithOptions(acts.EmitFlowEvent, activity.RegisterOptions{Name: adk.EmitFlowEventActivity})
+
+	in := adk.EmitFlowEventInput{FlowID: 7, Events: []adk.FlowEvent{
+		{Op: adk.FlowEventSetStatus, Status: "running"},
+	}}
+	_, err := env.ExecuteActivity(adk.EmitFlowEventActivity, in)
+
+	require.NoError(t, err)
+	assert.Equal(t, []adk.EmitFlowEventInput{in}, eventer.inputs)
+}
+
+func TestActivities_EmitFlowEvent_MissingEventerIsNotRetried(t *testing.T) {
+	acts := NewActivities(&fakeRunner{}, time.Second)
+
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivityWithOptions(acts.EmitFlowEvent, activity.RegisterOptions{Name: adk.EmitFlowEventActivity})
+
+	_, err := env.ExecuteActivity(adk.EmitFlowEventActivity, adk.EmitFlowEventInput{FlowID: 7})
+
+	var appErr *temporal.ApplicationError
+	require.ErrorAs(t, err, &appErr)
+	assert.True(t, appErr.NonRetryable())
 }

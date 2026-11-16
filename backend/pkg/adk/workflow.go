@@ -26,6 +26,13 @@ type PentestRequest struct {
 	Question    string `json:"question,omitempty"`
 	// ToolTimeoutSeconds overrides the activity deadline for each tool call.
 	ToolTimeoutSeconds int `json:"tool_timeout_seconds,omitempty"`
+	// FlowID, EmitEvents and EmitTaskQueue switch on the UI log bridge: each
+	// session event is translated and persisted through EmitFlowEventActivity
+	// on the flows queue — the queue the flow's log workers live on, which is
+	// why the child cannot just inherit its own. CLI runs leave them zero.
+	FlowID        int64  `json:"flow_id,omitempty"`
+	EmitEvents    bool   `json:"emit_events,omitempty"`
+	EmitTaskQueue string `json:"emit_task_queue,omitempty"`
 }
 
 type PentestResult struct {
@@ -88,6 +95,7 @@ func PentesterWorkflow(ctx workflow.Context, req PentestRequest) (PentestResult,
 	msg := genai.NewContentFromText(cmp.Or(req.Question, req.Task), genai.RoleUser)
 
 	var res PentestResult
+	emitter := newEventEmitter(ctx, req)
 	for {
 		var events []*session.Event
 		for ev, err := range r.Run(adkCtx, userID, sessionID, msg, agent.RunConfig{}) {
@@ -99,6 +107,7 @@ func PentesterWorkflow(ctx workflow.Context, req PentestRequest) (PentestResult,
 			}
 			events = append(events, ev)
 			res.EventCount++
+			emitter.emit(ev)
 			if ev.Content == nil {
 				continue
 			}

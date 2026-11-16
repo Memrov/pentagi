@@ -87,9 +87,13 @@ func (c *Client) StartWorker(runner FlowRunner) error {
 	if prompter, ok := runner.(AgentPrompter); ok {
 		acts.prompter = prompter
 	}
+	if eventer, ok := runner.(FlowEventer); ok {
+		acts.eventer = eventer
+	}
 	w.RegisterActivityWithOptions(acts.ResumeFlow, activity.RegisterOptions{Name: ResumeFlowActivity})
 	w.RegisterActivityWithOptions(acts.ProcessFlowInput, activity.RegisterOptions{Name: ProcessInputActivity})
 	w.RegisterActivityWithOptions(acts.RenderAgentPrompt, activity.RegisterOptions{Name: RenderPromptActivity})
+	w.RegisterActivityWithOptions(acts.EmitFlowEvent, activity.RegisterOptions{Name: adk.EmitFlowEventActivity})
 
 	if err := w.Start(); err != nil {
 		return fmt.Errorf("failed to start temporal worker on %s: %w", c.taskQueue, err)

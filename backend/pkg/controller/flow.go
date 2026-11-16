@@ -77,6 +77,7 @@ type flowWorker struct {
 	durableMX sync.Mutex
 	flowCtx   *FlowContext
 	docker    docker.DockerClient
+	events    *adkEventSink
 	logger    *logrus.Entry
 }
 
@@ -279,17 +280,18 @@ func buildFlowWorker(
 	executor.SetGraphitiClient(fwc.provs.GraphitiClient())
 
 	flowCtx := &FlowContext{
-		DB:         fwc.db,
-		UserID:     fwc.userID,
-		FlowID:     flow.ID,
-		TraceID:    observation.TraceID(),
-		Engine:     flow.Engine,
-		Executor:   executor,
-		Provider:   flowProvider,
-		Publisher:  pub,
-		MsgLog:     workers.mlw,
-		TermLog:    workers.tlw,
-		Screenshot: workers.sw,
+		DB:          fwc.db,
+		UserID:      fwc.userID,
+		FlowID:      flow.ID,
+		TraceID:     observation.TraceID(),
+		Engine:      flow.Engine,
+		Executor:    executor,
+		Provider:    flowProvider,
+		Publisher:   pub,
+		MsgLog:      workers.mlw,
+		TermLog:     workers.tlw,
+		ToolCallLog: workers.tclw,
+		Screenshot:  workers.sw,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx, _ = obs.Observer.NewObservation(ctx, langfuse.WithObservationTraceID(observation.TraceID()))
@@ -316,6 +318,7 @@ func buildFlowWorker(
 			"component": "worker",
 		}),
 	}
+	fw.events = newADKEventSink(flowCtx, fw.SetStatus)
 
 	if err := executor.Prepare(ctx); err != nil {
 		return nil, wrapErrorEndSpan(ctx, flowSpan, "failed to prepare flow resources", err)
@@ -450,17 +453,18 @@ func LoadFlowWorker(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) 
 	executor.SetGraphitiClient(fwc.provs.GraphitiClient())
 
 	flowCtx := &FlowContext{
-		DB:         fwc.db,
-		UserID:     flow.UserID,
-		FlowID:     flow.ID,
-		TraceID:    observation.TraceID(),
-		Engine:     flow.Engine,
-		Executor:   executor,
-		Provider:   flowProvider,
-		Publisher:  pub,
-		MsgLog:     workers.mlw,
-		TermLog:    workers.tlw,
-		Screenshot: workers.sw,
+		DB:          fwc.db,
+		UserID:      flow.UserID,
+		FlowID:      flow.ID,
+		TraceID:     observation.TraceID(),
+		Engine:      flow.Engine,
+		Executor:    executor,
+		Provider:    flowProvider,
+		Publisher:   pub,
+		MsgLog:      workers.mlw,
+		TermLog:     workers.tlw,
+		ToolCallLog: workers.tclw,
+		Screenshot:  workers.sw,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx, _ = obs.Observer.NewObservation(ctx, langfuse.WithObservationTraceID(observation.TraceID()))
@@ -487,6 +491,7 @@ func LoadFlowWorker(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) 
 			"component": "worker",
 		}),
 	}
+	fw.events = newADKEventSink(flowCtx, fw.SetStatus)
 
 	if err := executor.Prepare(ctx); err != nil {
 		return nil, wrapErrorEndSpan(ctx, flowSpan, "failed to prepare flow resources", err)

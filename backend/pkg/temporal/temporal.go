@@ -11,6 +11,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"pentagi/pkg/adk"
 )
 
 const (
@@ -123,6 +125,14 @@ type RenderedPrompt struct {
 // usually the same runner that serves FlowRunner.
 type AgentPrompter interface {
 	RenderAgentPrompt(ctx context.Context, req PromptRenderRequest) (RenderedPrompt, error)
+}
+
+// FlowEventer is the persistence capability behind adk.EmitFlowEventActivity:
+// translated session events land on the flow's own log workers, which only
+// the process holding the loaded flow can reach. It is usually the same
+// runner that serves FlowRunner.
+type FlowEventer interface {
+	EmitFlowEvent(ctx context.Context, in adk.EmitFlowEventInput) error
 }
 
 type FlowState struct {

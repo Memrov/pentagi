@@ -387,3 +387,93 @@ func TestActivities_ExecSandboxed_PropagatesResolverError(t *testing.T) {
 	require.True(t, env.IsWorkflowCompleted())
 	require.Error(t, env.GetWorkflowError())
 }
+
+// fakeTermLog records the (direction, text) pairs the sink seam writes.
+type fakeTermLog struct {
+	mu      sync.Mutex
+	entries []string
+	err     error
+}
+
+func (f *fakeTermLog) TermLog(_ context.Context, direction, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries = append(f.entries, direction+":"+text)
+	return f.err
+}
+
+func (f *fakeTermLog) all() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.entries...)
+}
+
+func TestActivities_TerminalExec_WritesTermLogAroundExec(t *testing.T) {
+	tl := &fakeTermLog{}
+	sb := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
+		// By the time the command runs the stdin row must already be logged:
+		// the production ordering keeps the prompt above its output.
+		assert.Equal(t, 1, len(tl.all()), "stdin must be logged before exec")
+		return ExecResult{Output: "uid=0", ExitCode: 0}, nil
+	}}
+	acts := NewActivities(sb, nil, 1024, time.Minute)
+	acts.TermLogFor = func(_ context.Context, flowID int64) (TermLogSink, error) {
+		assert.Equal(t, int64(42), flowID)
+		return tl, nil
+	}
+
+	env := runTerminalInWorkflow("pentagi-flow-42-input-0", acts)
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+
+	entries := tl.all()
+	require.Len(t, entries, 2)
+	assert.Equal(t, "stdin:/work $ \033[96mid\033[0m\r\n", entries[0])
+	assert.Equal(t, "stdout:\033[92muid=0\n[exit code: 0]\033[0m\r\n", entries[1])
+}
+
+func TestActivities_TerminalExec_NoTermLogResolverSkipsLogging(t *testing.T) {
+	sb := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
+		return ExecResult{Output: "ok"}, nil
+	}}
+	acts := NewActivities(sb, nil, 1024, time.Minute)
+
+	env := runTerminalInWorkflow("pentagi-flow-42-input-0", acts)
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	assert.Len(t, sb.calls(), 1)
+}
+
+func TestActivities_TerminalExec_TermLogErrorsDoNotFailExec(t *testing.T) {
+	sb := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
+		return ExecResult{Output: "ok"}, nil
+	}}
+	acts := NewActivities(sb, nil, 1024, time.Minute)
+	acts.TermLogFor = func(context.Context, int64) (TermLogSink, error) {
+		return &fakeTermLog{err: errors.New("db down")}, nil
+	}
+
+	env := runTerminalInWorkflow("pentagi-flow-42-input-0", acts)
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	assert.Len(t, sb.calls(), 1)
+}
+
+func TestActivities_TerminalExec_TermLogSkippedOutsideFlowWorkflow(t *testing.T) {
+	sb := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
+		return ExecResult{Output: "ok"}, nil
+	}}
+	acts := NewActivities(sb, nil, 1024, time.Minute)
+	acts.TermLogFor = func(context.Context, int64) (TermLogSink, error) {
+		return nil, errors.New("must not be consulted for an unparseable workflow id")
+	}
+
+	env := runTerminalInWorkflow("", acts)
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	assert.Len(t, sb.calls(), 1)
+}

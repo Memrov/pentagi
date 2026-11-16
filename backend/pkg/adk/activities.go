@@ -29,6 +29,16 @@ const (
 	defaultExtraExecTimeout       = 5 * time.Second
 )
 
+// The styling the UI terminal replays, verbatim from pkg/tools/terminal.go:
+// commands are framed cyan, command output green.
+const (
+	ansiColorInputCmd  = "\033[96m"
+	ansiColorSystemMsg = "\033[92m"
+	ansiColorReset     = "\033[0m"
+	ansiLineEnd        = "\r\n"
+	defaultWorkDir     = "/work"
+)
+
 // Activities are the worker-side implementations behind the durable tools;
 // every method executes inside one sandboxed activity attempt.
 type Activities struct {
@@ -45,6 +55,9 @@ type Activities struct {
 	// the shared sandbox, which is what binds production tools to the flow's
 	// primary container without this package knowing flow rows.
 	SandboxFor func(ctx context.Context, flowID int64) (Sandbox, error)
+	// TermLogFor resolves the flow's terminal-log sink on the same workflow-id
+	// key; nil keeps terminal calls unlogged, which is the CLI path.
+	TermLogFor func(ctx context.Context, flowID int64) (TermLogSink, error)
 }
 
 func NewActivities(sandbox Sandbox, payload PayloadStore, threshold int, defTimeout time.Duration) *Activities {
@@ -87,6 +100,10 @@ func (a *Activities) TerminalExec(ctx context.Context, in TerminalExecInput) (To
 	if a.FlowBound {
 		argv = flowCommand(in.Input)
 	}
+	tl := a.termLog(ctx)
+	if tl != nil {
+		a.putTermLog(ctx, tl, "stdin", stdinPrompt(in.Cwd, in.Input))
+	}
 	res, err := a.execSandboxed(ctx, argv, ExecOptions{
 		Cwd:     in.Cwd,
 		Timeout: timeout,
@@ -95,7 +112,49 @@ func (a *Activities) TerminalExec(ctx context.Context, in TerminalExecInput) (To
 	if err != nil {
 		return ToolResult{}, err
 	}
-	return a.terminalResult(ctx, res, timeout), nil
+	out := a.terminalResult(ctx, res, timeout)
+	if tl != nil && out.Output != "" {
+		a.putTermLog(ctx, tl, "stdout",
+			fmt.Sprintf("%s%s%s%s", ansiColorSystemMsg, out.Output, ansiColorReset, ansiLineEnd))
+	}
+	return out, nil
+}
+
+// stdinPrompt renders the line the UI terminal shows before the command's
+// output — the same "cwd $ command" frame the production terminal writes into
+// the termlog.
+func stdinPrompt(cwd, command string) string {
+	if cwd == "" {
+		cwd = defaultWorkDir
+	}
+	return fmt.Sprintf("%s $ %s%s%s%s", cwd, ansiColorInputCmd, command, ansiColorReset, ansiLineEnd)
+}
+
+// termLog resolves the per-flow sink the same way execSandboxed resolves the
+// per-flow sandbox: through the activity attempt's workflow id. A sink error
+// downgrades the exec's observability, so it is logged and skipped.
+func (a *Activities) termLog(ctx context.Context) TermLogSink {
+	if a.TermLogFor == nil || !activity.IsActivity(ctx) {
+		return nil
+	}
+	flowID, ok := FlowIDFromWorkflowID(activity.GetInfo(ctx).WorkflowExecution.ID)
+	if !ok {
+		return nil
+	}
+	tl, err := a.TermLogFor(ctx, flowID)
+	if err != nil {
+		activity.GetLogger(ctx).Warn("terminal log sink resolution failed", "error", err)
+		return nil
+	}
+	return tl
+}
+
+// putTermLog is the write tail: a row the flow's termlog worker rejects does
+// not fail the command the row described.
+func (a *Activities) putTermLog(ctx context.Context, tl TermLogSink, direction, text string) {
+	if err := tl.TermLog(ctx, direction, text); err != nil {
+		activity.GetLogger(ctx).Warn("terminal log write failed", "direction", direction, "error", err)
+	}
 }
 
 // terminalResult applies the production formatting contract: a started

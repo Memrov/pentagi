@@ -91,6 +91,12 @@ func FlowWorkflow(ctx workflow.Context, params FlowParams) error {
 	// parent under the default close policy, so the id can never collide
 	// with a still-running one. The prompts are rendered in an activity
 	// first because the prompter reads the DB.
+	//
+	// The child emits its session events back through EmitFlowEvent on this
+	// queue — the flows queue is where the flow's log workers live. Around
+	// the child the parent emits the flow's status itself: the child never
+	// sees a finished/cancelled end to mark waiting from, so the boundary
+	// belongs to the side that knows the run is over.
 	runAdkInput := func(input string) {
 		if params.ADK.TaskQueue == "" {
 			logger.Error("adk engine flow has no adk task queue configured; dropping input",
@@ -98,10 +104,22 @@ func FlowWorkflow(ctx workflow.Context, params FlowParams) error {
 			return
 		}
 
+		emitStatus := func(c workflow.Context, status string) workflow.Future {
+			return workflow.ExecuteActivity(
+				workflow.WithActivityOptions(c, adk.EmitActivityOptions(workflow.GetInfo(ctx).TaskQueueName)),
+				adk.EmitFlowEventActivity,
+				adk.EmitFlowEventInput{FlowID: params.FlowID, Events: []adk.FlowEvent{
+					{Op: adk.FlowEventSetStatus, Status: status},
+				}})
+		}
+
 		req := adk.PentestRequest{
 			Task:               input,
 			Model:              params.ADK.Model,
 			ToolTimeoutSeconds: params.ADK.ToolTimeoutSeconds,
+			FlowID:             params.FlowID,
+			EmitEvents:         true,
+			EmitTaskQueue:      workflow.GetInfo(ctx).TaskQueueName,
 		}
 
 		var rendered RenderedPrompt
@@ -115,6 +133,15 @@ func FlowWorkflow(ctx workflow.Context, params FlowParams) error {
 		}
 		req.Instruction = rendered.Instruction
 		req.Question = rendered.Question
+
+		if !await(func(c workflow.Context) workflow.Future { return emitStatus(c, "running") }, nil) {
+			return
+		}
+		// An emit failure is logged inside await; the run continues because a
+		// missing status row is cheaper than a stalled pentest.
+		defer func() {
+			await(func(c workflow.Context) workflow.Future { return emitStatus(c, "waiting") }, nil)
+		}()
 
 		childID := fmt.Sprintf("%s-input-%d", workflow.GetInfo(ctx).WorkflowExecution.ID, state.Processed)
 		var res adk.PentestResult

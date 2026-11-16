@@ -69,6 +69,7 @@ export TEMPORAL_API_KEY=...   # enables TLS + API-key auth
 - File activity: positional read/write argv, the `edit_file` refusal, missing-action inference, shell-expansion path rejection, hostile-but-legal paths staying positional, and the executor's exact truncation markers at the 32 KiB boundary.
 - The prompt seam: `PentesterPromptVars` keys match the production map, tool-name variables appear only for registered tools, and instruction/question overrides reach the model request in both modes.
 - Tool activities heartbeat every 5 s (with elapsed-time details) against a 30 s `HeartbeatTimeout`, and `InvokeModel` gets the same heartbeat timeout plus a bounded retry via `WithModelActivityOptions`, so a dead worker or wedged provider is detected in tens of seconds instead of waiting out `StartToCloseTimeout`; a live worker-restart run on Temporal Cloud confirmed the retry-onto-new-worker path. The exec timeout is clamped to the activity's remaining deadline (detached commands exempt — their point is to outlive the call), and parent cancellation propagates as `context.Canceled` while the tool's own deadline produces the graceful `timed_out` result. Cancellation also kills the whole process group — locally via `Setpgid`, in Docker via a PID marker file and a cleanup exec.
+- The Phase 3 bridge: scripted runs assert one `EmitFlowEvent` per session event with the translated ops (call start/end pairs, the hack_result `done` row), an emit failure leaves the workflow green, the adapter tests verify toolcall/msglog/termlog/status writes against fake workers including UTF-8 sanitization and start-idempotency, and the termlog seam is proven before-and-after exec through the activity env.
 
 ## Production wiring (Phase 2)
 
@@ -86,20 +87,41 @@ The second worker shares the server process: when `TEMPORAL_ENABLED` and `ADK_WO
 
 Tool activities resolve their sandbox per attempt: an activity whose workflow id parses as a flow child id (`adk.FlowIDFromWorkflowID`) binds a `DockerSandbox` to the flow's primary container via `controller.NewADKSandboxResolver`, and anything else — a CLI spike run, a hand-typed id — falls back to `ADK_SANDBOX_CONTAINER`. `ADK_SANDBOX=docker` is required for that binding; `local` keeps everything on the host for development.
 
+## Event bridge (Phase 3)
+
+Phase 3 makes an adk run visible in the existing UI without any new GraphQL types or frontend work: the child workflow translates each `session.Event` into `adk.FlowEvent` ops and executes `pentagi.adk.EmitFlowEvent` once per event on the **flows** queue — the queue where the flow's in-memory log workers live, which is why the child cannot inherit its own queue. `EmitEvents`/`FlowID`/`EmitTaskQueue` ride on `PentestRequest`; the parent sets them for engine=adk inputs and CLI runs leave them zero. The emit call is one short activity (60 s, 3 attempts) whose failure is logged and swallowed — observability is non-critical, a dead flows queue must not stall a pentest.
+
+The flows-queue activity delegates to `durableRunner.EmitFlowEvent`, which resolves the flow through the same `fc.GetFlow` registry the run itself uses, then to `adkEventSink` — a per-flow-worker adapter (`controller/adkevents.go`) writing through the existing workers, so persist→publish→subscription is exactly the legacy pipeline. Event-to-row mapping:
+
+| ADK event shape | Ops emitted | Rows written |
+| --- | --- | --- |
+| `FunctionCall` part | `tool_call_start` (+ `message` when the call is `hack_result`) | `toolcalls` row `running` (call_id, name, args) + paired `msglogs` row — type from the tool (`terminal`→terminal, `file`→file, `nuclei_scan`/`httpx_probe`→search, else thoughts), headline = args' `message` or the tool name |
+| `FunctionResponse` part | `tool_call_end` | `toolcalls` row `finished`/`failed` with folded result text (`output`, plus `[exit code: N]`/`[payload: …]`/`[timed out]`/`{error: …}` markers) and duration; paired `msglogs` row gets the same result with format terminal/markdown/plain like production |
+| `hack_result` call | extra `message` op | one `done` row: headline = `message` arg, result = the report — production's report barrier row |
+| text part | `message` (thoughts) | `msglogs` thoughts row |
+| `Thought` part | folded into the sibling ops | lands on the paired row's `thinking` column |
+| run boundary | `flow_status` | `flows.status` running before the child, waiting after — the pair the legacy task worker maintains itself; emitted by the **parent** because a cancelled child never sees its own end |
+
+Start/end correlation is `callID → {toolcall id, msglog id}` in adapter memory; a close whose start predates a backend restart falls back to the toolcalls `call_id` index (the msglog row has no such index and keeps its headline — the same loss a mid-call crash costs production). `ToolCallStart` is idempotent per call id so a retried emit cannot double-open rows. Everything crosses `database.SanitizeUTF8` at the adapter; the workers' own 2048-char headline truncation and sanitization are reused, not duplicated.
+
+Terminal output reaches the termlog on a second seam: `Activities.TermLogFor` resolves the same per-flow sink by the activity's workflow id (nil resolver → the CLI path stays quiet), and `TerminalExec` writes styled `stdin` before exec and `stdout` after, matching the production `/work $ cmd` framing and green-output styling. The sink is called directly — activities cannot schedule activities — and its failures downgrade to warnings, never a failed command.
+
 ## Open gaps for the port
 
 Phase 1 closed: the production `terminal`/`file`/`hack_result` tool surface with verbatim schemas and descriptions, terminal timeout/detach/result parity, the `hack_result` loop barrier in both modes, flow-bound command marking, and the rendered-prompt injection seam.
 
 Phase 2 closed: the per-flow engine flag end to end (migration, `FLOW_ENGINE`, row stamping, engine lookup into `FlowParams`), child dispatch on the scoped adk queue with deterministic ids, the `pentagi.RenderAgentPrompt` activity on the production prompt path, the in-process adk worker, flow-bound sandbox resolution, and the adk bypass of task-level recovery.
 
+Phase 3 closed: the `pentagi.adk.EmitFlowEvent` activity on the flows queue, the `session.Event → FlowEvent` translation with toolcall/msglog/flow-status rows through the existing workers, the terminal `TermLogFor` sink seam, and the running/waiting status bracket the parent emits around each child.
+
 Remaining:
 
 - Sub-agent tools (`pentester`, `coder`, `searcher`, `advice`, `memorist`, `maintenance`, `search`/`web_search`, guide stores, `graphiti_search`) — `PentesterPromptVars` already maps their variable names; the activities and handlers are not ported.
+- agentlog and searchlog rows: the bridge writes msglogs, toolcalls and termlogs only — the `agentlogs`/`searchlogs` feeds production fills for sub-agent turns and search results have no ADK source events yet (Phase 4, with the sub-agent tools).
 - `edit_file` diff application (needs container copy plumbing beyond the exec surface) and `ask`/`ask_user` for durable user interaction beyond the confirmation signal.
-- Event bridge to production observability and the UI: ADK events are collected inside the child workflow but never surface as flow logs, termlogs or Langfuse observations, so an adk run is invisible in the flow transcript.
 - The fixer and reflector chains — the tool-call fixer on malformed calls and the post-run reflector are production prompt-driven flows with no ADK equivalent yet.
 - Per-user provider resolution: the adk model is one global `ADK_*` config rather than the flow's configured provider and model, so an adk flow ignores its provider row.
 - Session carry-over across continue-as-new (`googleadk.ExportSession`/`ImportSession`) for long tasks — the workflow is single-run today, and `pentagi.hack_result` state is extracted from events rather than read back from an exported session.
-- Fetching `payload_uri` blobs back when the model needs more than the preview.
-- Mapping PentAGI's task/subtask lifecycle and message chains onto ADK sessions.
+- Fetching `payload_uri` blobs back when the model needs more than the preview (the marker already folds into the toolcall/msglog result text).
+- Mapping PentAGI's task/subtask lifecycle and message chains onto ADK sessions — bridge rows are flow-level with nil task/subtask ids.
 - The authorization guard wiring — `ScopeGuard` stays the isolated seam.

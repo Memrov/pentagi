@@ -158,7 +158,9 @@ type childRun struct {
 }
 
 // newAdkEnv registers the flow workflow, the prompt render activity stub and
-// a pentester child stub whose runs land in the returned slice.
+// a pentester child stub whose runs land in the returned slice. The emit
+// activity is captured too: the parent emits the flow's status around each
+// child run, so an env without it would pass with a noisy dead emit.
 func newAdkEnv(
 	t *testing.T,
 	render func(context.Context, PromptRenderRequest) (RenderedPrompt, error),
@@ -186,8 +188,42 @@ func newAdkEnv(
 		return res, err
 	}, workflow.RegisterOptions{Name: adk.PentesterWorkflowName})
 
+	emits = &emitRecorder{}
+	env.RegisterActivityWithOptions(emits.record,
+		activity.RegisterOptions{Name: adk.EmitFlowEventActivity})
+
 	return env, &runs
 }
+
+// emitRecorder captures the parent's EmitFlowEvent calls; tests reach it
+// through the package-level emits the env installs before registering.
+type emitRecorder struct {
+	mu     sync.Mutex
+	inputs []adk.EmitFlowEventInput
+}
+
+func (r *emitRecorder) record(_ context.Context, in adk.EmitFlowEventInput) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.inputs = append(r.inputs, in)
+	return nil
+}
+
+func (r *emitRecorder) statuses() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for _, in := range r.inputs {
+		for _, ev := range in.Events {
+			if ev.Op == adk.FlowEventSetStatus {
+				out = append(out, ev.Status)
+			}
+		}
+	}
+	return out
+}
+
+var emits *emitRecorder
 
 func renderOK(_ context.Context, req PromptRenderRequest) (RenderedPrompt, error) {
 	return RenderedPrompt{Instruction: "rendered instruction", Question: "rendered " + req.Input}, nil
@@ -222,7 +258,12 @@ func TestWorkflow_FlowWorkflow_AdkEngineDispatchesInputsToChildWorkflows(t *test
 		Instruction:        "rendered instruction",
 		Question:           "rendered scan target",
 		ToolTimeoutSeconds: 60,
+		FlowID:             7,
+		EmitEvents:         true,
+		EmitTaskQueue:      "default-test-taskqueue",
 	}, run.req)
+	assert.Equal(t, []string{"running", "waiting"}, emits.statuses(),
+		"the parent brackets the child run with the flow's status")
 }
 
 func TestWorkflow_FlowWorkflow_AdkEngineRecordsResultSummaryInState(t *testing.T) {
