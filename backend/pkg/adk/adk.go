@@ -10,12 +10,13 @@ import "time"
 const (
 	PentesterWorkflowName = "pentagi.adk.PentesterWorkflow"
 
-	TerminalToolName   = "terminal"
-	FileToolName       = "file"
-	HackResultToolName = "hack_result"
-	NucleiToolName     = "nuclei_scan"
-	HttpxToolName      = "httpx_probe"
-	AdviceToolName     = "advice"
+	TerminalToolName    = "terminal"
+	FileToolName        = "file"
+	HackResultToolName  = "hack_result"
+	NucleiToolName      = "nuclei_scan"
+	HttpxToolName       = "httpx_probe"
+	AdviceToolName      = "advice"
+	PayloadReadToolName = "payload_read"
 
 	appName = "pentagi-adk"
 

@@ -43,27 +43,38 @@ func schemaProps(t *testing.T, tl tool.Tool) map[string]any {
 	return props
 }
 
-func TestDurableTools_ExposesFiveNamedTools(t *testing.T) {
-	tools, err := DurableTools(time.Minute)
-	require.NoError(t, err)
-	require.Len(t, tools, 5)
+func TestDurableTools_ExposesNamedTools(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		payloadRead bool
+		want        []string
+	}{
+		{"without a store the reader stays unadvertised", false,
+			[]string{"hack_result", "terminal", "file", "nuclei_scan", "httpx_probe"}},
+		{"a configured store adds payload_read", true,
+			[]string{"hack_result", "terminal", "file", "nuclei_scan", "httpx_probe", "payload_read"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tools, err := DurableTools(time.Minute, tc.payloadRead)
+			require.NoError(t, err)
+			require.Len(t, tools, len(tc.want))
 
-	byName := map[string]bool{}
-	for _, tl := range tools {
-		byName[tl.Name()] = true
-		assert.NotEmpty(t, tl.Description())
+			byName := map[string]bool{}
+			for _, tl := range tools {
+				byName[tl.Name()] = true
+				assert.NotEmpty(t, tl.Description())
+			}
+			for _, name := range tc.want {
+				assert.True(t, byName[name], "tool %q missing", name)
+			}
+		})
 	}
-	assert.True(t, byName["terminal"])
-	assert.True(t, byName["file"])
-	assert.True(t, byName["hack_result"])
-	assert.True(t, byName["nuclei_scan"])
-	assert.True(t, byName["httpx_probe"])
 }
 
 // The schema names are the production tool contract: the prompt the model was
 // trained against refers to these exact argument names.
 func TestDurableTools_SchemaCarriesProductionFields(t *testing.T) {
-	tools, err := DurableTools(time.Minute)
+	tools, err := DurableTools(time.Minute, true)
 	require.NoError(t, err)
 
 	for _, tl := range tools {
@@ -82,6 +93,10 @@ func TestDurableTools_SchemaCarriesProductionFields(t *testing.T) {
 			assert.Contains(t, props, "success")
 		case NucleiToolName, HttpxToolName:
 			assert.Contains(t, props, "target")
+		case PayloadReadToolName:
+			assert.Contains(t, props, "uri")
+			assert.Contains(t, props, "offset_bytes")
+			assert.Contains(t, props, "max_bytes")
 		}
 	}
 }

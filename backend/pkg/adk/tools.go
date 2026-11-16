@@ -64,6 +64,23 @@ type ToolResult struct {
 	PayloadURI string `json:"payload_uri,omitempty"`
 }
 
+// PayloadReadInput fetches one window of a stored payload. offset_bytes
+// continues from a previous next_offset; max_bytes caps the window.
+type PayloadReadInput struct {
+	URI         string `json:"uri"`
+	OffsetBytes int    `json:"offset_bytes,omitempty"`
+	MaxBytes    int    `json:"max_bytes,omitempty"`
+}
+
+// PayloadReadOutput is the window: the slice plus the cursor state the model
+// needs to decide whether to keep reading.
+type PayloadReadOutput struct {
+	Content    string `json:"content"`
+	TotalBytes int    `json:"total_bytes"`
+	NextOffset int    `json:"next_offset"`
+	Truncated  bool   `json:"truncated"`
+}
+
 // Signature anchors for ActivityAsTool, which infers the model-facing schema
 // from the argument type but dispatches by name only — the registered
 // Activities method is what runs, so these bodies never execute.
@@ -75,12 +92,16 @@ func fileExecShape(context.Context, FileExecInput) (ToolResult, error) { return 
 
 func nucleiScanShape(context.Context, NucleiScanInput) (ToolResult, error) { return ToolResult{}, nil }
 func httpxProbeShape(context.Context, HttpxProbeInput) (ToolResult, error) { return ToolResult{}, nil }
+func payloadReadShape(context.Context, PayloadReadInput) (PayloadReadOutput, error) {
+	return PayloadReadOutput{}, nil
+}
 
 var (
-	_ func(context.Context, TerminalExecInput) (ToolResult, error) = (*Activities)(nil).TerminalExec
-	_ func(context.Context, FileExecInput) (ToolResult, error)     = (*Activities)(nil).FileExec
-	_ func(context.Context, NucleiScanInput) (ToolResult, error)   = (*Activities)(nil).NucleiScan
-	_ func(context.Context, HttpxProbeInput) (ToolResult, error)   = (*Activities)(nil).HttpxProbe
+	_ func(context.Context, TerminalExecInput) (ToolResult, error)       = (*Activities)(nil).TerminalExec
+	_ func(context.Context, FileExecInput) (ToolResult, error)           = (*Activities)(nil).FileExec
+	_ func(context.Context, NucleiScanInput) (ToolResult, error)         = (*Activities)(nil).NucleiScan
+	_ func(context.Context, HttpxProbeInput) (ToolResult, error)         = (*Activities)(nil).HttpxProbe
+	_ func(context.Context, PayloadReadInput) (PayloadReadOutput, error) = (*Activities)(nil).PayloadRead
 )
 
 // Model-facing tool descriptions, shared by the durable and direct tool sets
@@ -99,13 +120,19 @@ const (
 		"Prefer severity and tags filters over broad scans."
 	httpxToolDesc = "Probe a target URL with httpx and return the JSON probe result " +
 		"(status, title, technologies, redirect chain)."
+	payloadReadToolDesc = "Fetch a stored tool-output payload by URI. " +
+		"A tool result with truncated=true carries a payload_uri field; pass that URI here to read " +
+		"the full blob in windows — offset_bytes to continue from a previous next_offset, " +
+		"max_bytes to bound one read (16384 default and maximum)."
 )
 
 // DurableTools builds the workflow-side tool set: terminal, file and the two
 // scanners become Temporal activities dispatched under the same name they are
 // registered with, while hack_result is an in-workflow function tool — its
 // result is the loop barrier and must never wait out an activity round-trip.
-func DurableTools(timeout time.Duration) ([]tool.Tool, error) {
+// payload_read joins them only when the worker has a payload store to read
+// through, so an advertised tool always answers.
+func DurableTools(timeout time.Duration, payloadRead bool) ([]tool.Tool, error) {
 	actOpts := workflow.ActivityOptions{
 		StartToCloseTimeout: timeout,
 		HeartbeatTimeout:    toolHeartbeatTimeout,
@@ -158,5 +185,19 @@ func DurableTools(timeout time.Duration) ([]tool.Tool, error) {
 		return nil, err
 	}
 
-	return []tool.Tool{hack, terminal, file, nuclei, httpx}, nil
+	tools := []tool.Tool{hack, terminal, file, nuclei, httpx}
+
+	if payloadRead {
+		read, err := googleadk.ActivityAsTool(payloadReadShape, googleadk.ActivityToolOptions{
+			Name:            PayloadReadToolName,
+			Description:     payloadReadToolDesc,
+			ActivityOptions: actOpts,
+		})
+		if err != nil {
+			return nil, err
+		}
+		tools = append(tools, read)
+	}
+
+	return tools, nil
 }

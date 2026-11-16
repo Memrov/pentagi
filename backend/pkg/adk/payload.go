@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,9 +18,10 @@ import (
 
 // PayloadStore holds oversized tool output outside the activity result, so a
 // large scan does not bloat workflow history. The model sees a preview and the
-// URI; fetching stays a follow-up step.
+// URI; payload_read resolves that URI back through Get.
 type PayloadStore interface {
 	Put(ctx context.Context, key string, data []byte) (uri string, err error)
+	Get(ctx context.Context, uri string) (data []byte, err error)
 }
 
 // MemoryPayloadStore is the in-process fallback when no bucket is configured;
@@ -54,16 +57,24 @@ func (s *MemoryPayloadStore) Put(_ context.Context, key string, data []byte) (st
 	return "mem://" + key, nil
 }
 
-func (s *MemoryPayloadStore) Get(key string) ([]byte, bool) {
+func (s *MemoryPayloadStore) Get(_ context.Context, uri string) ([]byte, error) {
+	key, ok := strings.CutPrefix(uri, "mem://")
+	if !ok {
+		return nil, fmt.Errorf("not a mem payload uri: %q", uri)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	data, ok := s.blobs[key]
-	return slices.Clone(data), ok
+	if !ok {
+		return nil, fmt.Errorf("payload %q not found", uri)
+	}
+	return slices.Clone(data), nil
 }
 
-// s3API is the single call the store makes, narrow enough to fake in tests.
+// s3API is the object API the store makes, narrow enough to fake in tests.
 type s3API interface {
 	PutObject(ctx context.Context, in *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	GetObject(ctx context.Context, in *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 }
 
 // S3PayloadStore writes blobs under "<prefix>/<date>/<uuid>.log" in one bucket;
@@ -96,4 +107,27 @@ func (s *S3PayloadStore) Put(ctx context.Context, key string, data []byte) (stri
 		return "", fmt.Errorf("failed to put payload to s3://%s/%s: %w", s.bucket, full, err)
 	}
 	return fmt.Sprintf("s3://%s/%s", s.bucket, full), nil
+}
+
+// Get resolves an s3:// URI the store issued back to its object; a URI in a
+// different bucket is refused rather than fetched — the reader must not reach
+// into buckets this worker was never configured to serve.
+func (s *S3PayloadStore) Get(ctx context.Context, uri string) ([]byte, error) {
+	bucket, key, found := strings.Cut(strings.TrimPrefix(uri, "s3://"), "/")
+	if !found || bucket != s.bucket {
+		return nil, fmt.Errorf("payload uri %q is outside bucket %q", uri, s.bucket)
+	}
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get payload from %s: %w", uri, err)
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read payload from %s: %w", uri, err)
+	}
+	return data, nil
 }

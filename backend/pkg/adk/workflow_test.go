@@ -57,6 +57,9 @@ func newPentestEnv(
 	gacts, err := googleadk.NewActivities(googleadk.Config{
 		Models: map[string]googleadk.ModelFactory{
 			modelName: func(context.Context, string) (model.LLM, error) { return mdl, nil },
+			agentModelName(AgentTypeAdviser, modelName): func(context.Context, string) (model.LLM, error) {
+				return mdl, nil
+			},
 		},
 	})
 	require.NoError(t, err)

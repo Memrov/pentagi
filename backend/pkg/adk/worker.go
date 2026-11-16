@@ -14,13 +14,20 @@ import (
 // activities) at worker start, with our openai-compatible model behind the
 // activity boundary. The key is checked here rather than in Config.Validate so
 // commands that never build a model ("run", "help") do not require it.
-func WorkerPlugin(cfg *Config) (worker.Plugin, error) {
+//
+// The plugin's Models map matches by name, and a workflow never sends a model
+// name other than cfg.ModelName or the adviser's marked handle — the real
+// model name comes out of the resolved credentials inside the activity, so
+// every provider-configured model is served by these two registrations.
+func WorkerPlugin(cfg *Config, resolver ProviderResolver) (worker.Plugin, error) {
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("ADK_API_KEY is required")
 	}
+	factory := ModelFactory(cfg, resolver)
 	return googleadk.NewPlugin(googleadk.Config{
 		Models: map[string]googleadk.ModelFactory{
-			cfg.ModelName: ModelFactory(cfg),
+			cfg.ModelName: factory,
+			agentModelName(AgentTypeAdviser, cfg.ModelName): factory,
 		},
 	})
 }

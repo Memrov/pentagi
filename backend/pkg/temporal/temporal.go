@@ -112,6 +112,9 @@ type ADKPolicy struct {
 	TaskQueue          string
 	Model              string
 	ToolTimeoutSeconds int
+	// PayloadRead tells the child to advertise payload_read: it is set when
+	// the adk worker was built with a payload store to fetch through.
+	PayloadRead bool
 }
 
 // PromptRenderRequest asks the flows worker for an agent's prompt pair.

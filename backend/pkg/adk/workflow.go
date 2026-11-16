@@ -47,6 +47,9 @@ type PentestRequest struct {
 	FlowID        int64  `json:"flow_id,omitempty"`
 	EmitEvents    bool   `json:"emit_events,omitempty"`
 	EmitTaskQueue string `json:"emit_task_queue,omitempty"`
+	// PayloadRead advertises the payload_read tool; the dispatcher sets it when
+	// the worker actually has a payload store to read through.
+	PayloadRead bool `json:"payload_read,omitempty"`
 }
 
 type PentestResult struct {
@@ -83,7 +86,7 @@ func PentesterWorkflow(ctx workflow.Context, req PentestRequest) (PentestResult,
 		toolTimeout = time.Duration(req.ToolTimeoutSeconds) * time.Second
 	}
 
-	tools, err := DurableTools(toolTimeout)
+	tools, err := DurableTools(toolTimeout, req.PayloadRead)
 	if err != nil {
 		return PentestResult{}, err
 	}
@@ -92,7 +95,13 @@ func PentesterWorkflow(ctx workflow.Context, req PentestRequest) (PentestResult,
 	mdl := googleadk.NewModel(modelName, googleadk.WithModelActivityOptions(modelActivityOptions))
 
 	if req.IncludeAdvice {
-		adviceTool, err := newAdviceTool(mdl, req.AdviceInstruction)
+		// The adviser gets its own model handle so the worker-side resolver
+		// sees which agent type asked — its provider config may name a
+		// different (cheaper) model than the pentester's.
+		adviceMdl := googleadk.NewModel(
+			agentModelName(AgentTypeAdviser, modelName),
+			googleadk.WithModelActivityOptions(modelActivityOptions))
+		adviceTool, err := newAdviceTool(adviceMdl, req.AdviceInstruction)
 		if err != nil {
 			return PentestResult{}, err
 		}

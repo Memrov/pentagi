@@ -235,7 +235,7 @@ func adkParams(pending ...string) FlowParams {
 		Engine:  EngineAdk,
 		Pending: pending,
 		Policy:  testPolicy,
-		ADK:     ADKPolicy{TaskQueue: "pentagi-adk", Model: "adk-model", ToolTimeoutSeconds: 60},
+		ADK:     ADKPolicy{TaskQueue: "pentagi-adk", Model: "adk-model", ToolTimeoutSeconds: 60, PayloadRead: true},
 	}
 }
 
@@ -263,6 +263,7 @@ func TestWorkflow_FlowWorkflow_AdkEngineDispatchesInputsToChildWorkflows(t *test
 		EmitTaskQueue:      "default-test-taskqueue",
 		IncludeAdvice:      true,
 		AdviceInstruction:  "rendered instruction",
+		PayloadRead:        true,
 	}, run.req)
 	assert.Equal(t, []string{"running", "waiting"}, emits.statuses(),
 		"the parent brackets the child run with the flow's status")

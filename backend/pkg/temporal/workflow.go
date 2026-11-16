@@ -121,6 +121,7 @@ func FlowWorkflow(ctx workflow.Context, params FlowParams) error {
 			EmitEvents:         true,
 			EmitTaskQueue:      workflow.GetInfo(ctx).TaskQueueName,
 			IncludeAdvice:      true,
+			PayloadRead:        params.ADK.PayloadRead,
 		}
 
 		var rendered RenderedPrompt

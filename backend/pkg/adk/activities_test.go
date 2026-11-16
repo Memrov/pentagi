@@ -267,9 +267,8 @@ func TestActivities_CapOutput_OffloadsOversizedOutput(t *testing.T) {
 	assert.Len(t, res.Output, 1024)
 	assert.True(t, strings.HasPrefix(res.PayloadURI, "mem://"))
 
-	key := strings.TrimPrefix(res.PayloadURI, "mem://")
-	blob, ok := store.Get(key)
-	require.True(t, ok, "payload store should hold the full output under the activity-scoped key")
+	blob, err := store.Get(context.Background(), res.PayloadURI)
+	require.NoError(t, err, "payload store should hold the full output under the activity-scoped key")
 	assert.Len(t, blob, 5000)
 }
 
@@ -300,8 +299,8 @@ func TestActivities_TerminalExec_OffloadsFormattedOutput(t *testing.T) {
 	assert.True(t, res.Truncated)
 	assert.Len(t, res.Output, 1024)
 
-	blob, ok := store.Get(strings.TrimPrefix(res.PayloadURI, "mem://"))
-	require.True(t, ok)
+	blob, err := store.Get(context.Background(), res.PayloadURI)
+	require.NoError(t, err)
 	assert.Equal(t, fmt.Sprintf("%s\n[exit code: 0]", strings.Repeat("x", 5000)), string(blob))
 }
 
@@ -476,4 +475,76 @@ func TestActivities_TerminalExec_TermLogSkippedOutsideFlowWorkflow(t *testing.T)
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())
 	assert.Len(t, sb.calls(), 1)
+}
+
+func TestActivities_PayloadRead_ServesWindows(t *testing.T) {
+	store := NewMemoryPayloadStore()
+	uri, err := store.Put(context.Background(), "w/1.log", []byte("0123456789abcdef"))
+	require.NoError(t, err)
+	acts := NewActivities(&fakeSandbox{}, store, 1024, time.Minute)
+
+	out, err := acts.PayloadRead(context.Background(), PayloadReadInput{URI: uri})
+	require.NoError(t, err)
+	assert.Equal(t, PayloadReadOutput{
+		Content: "0123456789abcdef", TotalBytes: 16, NextOffset: 16, Truncated: false,
+	}, out)
+
+	out, err = acts.PayloadRead(context.Background(), PayloadReadInput{URI: uri, OffsetBytes: 4, MaxBytes: 6})
+	require.NoError(t, err)
+	assert.Equal(t, PayloadReadOutput{
+		Content: "456789", TotalBytes: 16, NextOffset: 10, Truncated: true,
+	}, out)
+}
+
+// maxBytes is both the default and the ceiling: a read never exceeds 16 KiB.
+func TestActivities_PayloadRead_ClampsMaxBytes(t *testing.T) {
+	blob := make([]byte, 20<<10)
+	for i := range blob {
+		blob[i] = 'a'
+	}
+	store := NewMemoryPayloadStore()
+	uri, err := store.Put(context.Background(), "w/big.log", blob)
+	require.NoError(t, err)
+	acts := NewActivities(&fakeSandbox{}, store, 1024, time.Minute)
+
+	out, err := acts.PayloadRead(context.Background(), PayloadReadInput{URI: uri, MaxBytes: 1 << 20})
+	require.NoError(t, err)
+	assert.Len(t, out.Content, 16<<10)
+	assert.Equal(t, 16<<10, out.NextOffset)
+	assert.True(t, out.Truncated)
+}
+
+// An offset past the end is an empty untruncated answer, not an error — a
+// stale next_offset must not crash the read.
+func TestActivities_PayloadRead_OffsetPastEndReadsEmpty(t *testing.T) {
+	store := NewMemoryPayloadStore()
+	uri, err := store.Put(context.Background(), "w/1.log", []byte("short"))
+	require.NoError(t, err)
+	acts := NewActivities(&fakeSandbox{}, store, 1024, time.Minute)
+
+	out, err := acts.PayloadRead(context.Background(), PayloadReadInput{URI: uri, OffsetBytes: 999})
+	require.NoError(t, err)
+	assert.Equal(t, "", out.Content)
+	assert.Equal(t, 5, out.NextOffset)
+	assert.False(t, out.Truncated)
+}
+
+func TestActivities_PayloadRead_ReportsMissingURIAsContent(t *testing.T) {
+	acts := NewActivities(&fakeSandbox{}, NewMemoryPayloadStore(), 1024, time.Minute)
+
+	out, err := acts.PayloadRead(context.Background(), PayloadReadInput{URI: "mem://gone.log"})
+	require.NoError(t, err)
+	assert.Contains(t, out.Content, "not found")
+}
+
+func TestActivities_PayloadRead_RequiresURIAndStore(t *testing.T) {
+	acts := NewActivities(&fakeSandbox{}, NewMemoryPayloadStore(), 1024, time.Minute)
+	out, err := acts.PayloadRead(context.Background(), PayloadReadInput{})
+	require.NoError(t, err)
+	assert.Contains(t, out.Content, "uri is required")
+
+	acts = NewActivities(&fakeSandbox{}, nil, 1024, time.Minute)
+	out, err = acts.PayloadRead(context.Background(), PayloadReadInput{URI: "mem://x"})
+	require.NoError(t, err)
+	assert.Contains(t, out.Content, "not configured")
 }

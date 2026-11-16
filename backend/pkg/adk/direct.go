@@ -70,7 +70,22 @@ func DirectTools(sb Sandbox, payload PayloadStore, threshold int, toolTimeout ti
 		return nil, err
 	}
 
-	return []tool.Tool{hack, terminal, file, nuclei, httpx}, nil
+	tools := []tool.Tool{hack, terminal, file, nuclei, httpx}
+
+	if payload != nil {
+		read, err := functiontool.New(functiontool.Config{
+			Name:        PayloadReadToolName,
+			Description: payloadReadToolDesc,
+		}, func(ctx agent.Context, in PayloadReadInput) (PayloadReadOutput, error) {
+			return acts.PayloadRead(ctx, in)
+		})
+		if err != nil {
+			return nil, err
+		}
+		tools = append(tools, read)
+	}
+
+	return tools, nil
 }
 
 // RunDirect executes the pentester agent in-process, no Temporal: the fast path
@@ -81,7 +96,7 @@ func RunDirect(ctx context.Context, cfg *Config, sb Sandbox, payload PayloadStor
 	if cfg.APIKey == "" {
 		return PentestResult{}, fmt.Errorf("ADK_API_KEY is required")
 	}
-	mdl, err := ModelFactory(cfg)(ctx, cfg.ModelName)
+	mdl, err := ModelFactory(cfg, nil)(ctx, cfg.ModelName)
 	if err != nil {
 		return PentestResult{}, fmt.Errorf("failed to build model: %w", err)
 	}

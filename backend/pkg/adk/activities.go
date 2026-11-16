@@ -73,6 +73,8 @@ func NewActivities(sandbox Sandbox, payload PayloadStore, threshold int, defTime
 }
 
 // Register exposes each tool under the same name ActivityAsTool dispatches.
+// payload_read is registered unconditionally — the toolset only advertises it
+// when a store exists, and a registered-but-unadvertised activity is inert.
 func (a *Activities) Register(r interface {
 	RegisterActivityWithOptions(any, activity.RegisterOptions)
 }) {
@@ -80,6 +82,7 @@ func (a *Activities) Register(r interface {
 	r.RegisterActivityWithOptions(a.FileExec, activity.RegisterOptions{Name: FileToolName})
 	r.RegisterActivityWithOptions(a.NucleiScan, activity.RegisterOptions{Name: NucleiToolName})
 	r.RegisterActivityWithOptions(a.HttpxProbe, activity.RegisterOptions{Name: HttpxToolName})
+	r.RegisterActivityWithOptions(a.PayloadRead, activity.RegisterOptions{Name: PayloadReadToolName})
 }
 
 func (a *Activities) TerminalExec(ctx context.Context, in TerminalExecInput) (ToolResult, error) {
@@ -286,6 +289,53 @@ func (a *Activities) exec(ctx context.Context, argv []string, opts ExecOptions) 
 	out.Output, out.PayloadURI, out.Truncated = a.capOutput(ctx, res.Output)
 	out.Truncated = out.Truncated || res.Truncated
 	return out, nil
+}
+
+// payloadReadMaxBytes bounds one fetch window: both the default when the
+// caller asks for nothing and the cap when it asks for too much — a tool
+// result stays a result, not a blob dump.
+const payloadReadMaxBytes = 16 << 10
+
+// PayloadRead is the activity behind payload_read: the model hands back the
+// URI a capped tool result carried in its payload_uri field and gets a window
+// of the stored blob. Fetch failures are reported in the content — the
+// swallow-and-report convention — never as an activity error.
+func (a *Activities) PayloadRead(ctx context.Context, in PayloadReadInput) (PayloadReadOutput, error) {
+	if a.payload == nil {
+		return PayloadReadOutput{Content: "payload store is not configured on this worker"}, nil
+	}
+	uri := strings.TrimSpace(in.URI)
+	if uri == "" {
+		return PayloadReadOutput{Content: "uri is required"}, nil
+	}
+	data, err := a.payload.Get(ctx, uri)
+	if err != nil {
+		return PayloadReadOutput{Content: fmt.Sprintf("failed to fetch payload: %v", err)}, nil
+	}
+	return windowPayload(data, in.OffsetBytes, in.MaxBytes), nil
+}
+
+// windowPayload slices one read out of the blob; an offset past the end is an
+// empty, untruncated answer rather than an error, so a model that follows a
+// stale next_offset learns there is nothing left.
+func windowPayload(data []byte, offset, maxBytes int) PayloadReadOutput {
+	if offset < 0 {
+		offset = 0
+	}
+	if maxBytes <= 0 || maxBytes > payloadReadMaxBytes {
+		maxBytes = payloadReadMaxBytes
+	}
+	total := len(data)
+	if offset > total {
+		offset = total
+	}
+	end := min(offset+maxBytes, total)
+	return PayloadReadOutput{
+		Content:    string(data[offset:end]),
+		TotalBytes: total,
+		NextOffset: end,
+		Truncated:  end < total,
+	}
 }
 
 // capOutput caps what the model sees: output over the threshold is handed to
