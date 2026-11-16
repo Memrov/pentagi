@@ -60,9 +60,6 @@ func TestConfig_Validate_RejectsInvalidFields(t *testing.T) {
 		want string
 	}{
 		{"bad sandbox", func(c *Config) { c.Sandbox = "podman" }, "ADK_SANDBOX"},
-		{"docker without container", func(c *Config) {
-			c.Sandbox = "docker"
-		}, "ADK_SANDBOX_CONTAINER"},
 		{"no payload threshold", func(c *Config) { c.PayloadThreshold = 0 }, "ADK_PAYLOAD_THRESHOLD"},
 		{"no tool timeout", func(c *Config) { c.ToolTimeoutSeconds = 0 }, "ADK_TOOL_TIMEOUT"},
 		{"no model name", func(c *Config) { c.ModelName = "" }, "ADK_MODEL_NAME"},
@@ -87,13 +84,10 @@ func TestConfig_Validate_RejectsInvalidFields(t *testing.T) {
 	}
 }
 
-func TestConfig_Validate_DockerRequiresContainer(t *testing.T) {
+func TestConfig_Validate_DockerAllowsEmptyContainer(t *testing.T) {
 	cfg := &Config{
 		Sandbox: "docker", PayloadThreshold: 1, ToolTimeoutSeconds: 60,
 		ModelName: "m", ModelAPI: "chat_completions", BaseURL: "https://x.test",
 	}
-	assert.ErrorContains(t, cfg.Validate(), "ADK_SANDBOX_CONTAINER")
-
-	cfg.SandboxContainer = "sandbox-1"
 	assert.NoError(t, cfg.Validate())
 }

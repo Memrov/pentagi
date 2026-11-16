@@ -12,8 +12,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
+	"go.temporal.io/sdk/workflow"
 )
 
 // optsRecordingSandbox captures the ExecOptions each call ran under.
@@ -311,4 +313,77 @@ func TestActivities_Exec_PropagatesSandboxError(t *testing.T) {
 
 	_, err := acts.TerminalExec(context.Background(), TerminalExecInput{Input: "id"})
 	assert.ErrorContains(t, err, "container gone")
+}
+
+// runTerminalInWorkflow executes TerminalExec as an activity inside a workflow
+// whose id is the one passed to SetStartWorkflowOptions, so the resolution
+// path sees the workflow id a FlowWorkflow child would carry.
+func runTerminalInWorkflow(workflowID string, acts *Activities) *testsuite.TestWorkflowEnvironment {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	if workflowID != "" {
+		env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: workflowID})
+	}
+	env.RegisterActivity(acts.TerminalExec)
+	env.ExecuteWorkflow(func(ctx workflow.Context) error {
+		var res ToolResult
+		return workflow.ExecuteActivity(workflow.WithActivityOptions(ctx,
+			workflow.ActivityOptions{StartToCloseTimeout: time.Minute}),
+			acts.TerminalExec, TerminalExecInput{Input: "id"}).Get(ctx, &res)
+	})
+	return env
+}
+
+func TestActivities_ExecSandboxed_ResolvesFlowSandboxFromWorkflowID(t *testing.T) {
+	base := &fakeSandbox{}
+	resolved := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
+		return ExecResult{Output: "bound"}, nil
+	}}
+	acts := NewActivities(base, nil, 1024, time.Minute)
+	flows := make(chan int64, 1)
+	acts.SandboxFor = func(_ context.Context, flowID int64) (Sandbox, error) {
+		flows <- flowID
+		return resolved, nil
+	}
+
+	env := runTerminalInWorkflow("t-pentagi-flow-42-input-0", acts)
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	select {
+	case flowID := <-flows:
+		assert.Equal(t, int64(42), flowID)
+	default:
+		t.Fatal("the sandbox resolver was never consulted")
+	}
+	assert.Empty(t, base.calls())
+	assert.Len(t, resolved.calls(), 1)
+}
+
+func TestActivities_ExecSandboxed_FallsBackForNonFlowWorkflowID(t *testing.T) {
+	base := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
+		return ExecResult{Output: "base"}, nil
+	}}
+	acts := NewActivities(base, nil, 1024, time.Minute)
+	acts.SandboxFor = func(context.Context, int64) (Sandbox, error) {
+		return nil, errors.New("must not be consulted for an unparseable workflow id")
+	}
+
+	env := runTerminalInWorkflow("", acts)
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	assert.Len(t, base.calls(), 1)
+}
+
+func TestActivities_ExecSandboxed_PropagatesResolverError(t *testing.T) {
+	acts := NewActivities(&fakeSandbox{}, nil, 1024, time.Minute)
+	acts.SandboxFor = func(context.Context, int64) (Sandbox, error) {
+		return nil, errors.New("no container row")
+	}
+
+	env := runTerminalInWorkflow("pentagi-flow-7-input-0", acts)
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.Error(t, env.GetWorkflowError())
 }

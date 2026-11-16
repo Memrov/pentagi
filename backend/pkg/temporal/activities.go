@@ -11,6 +11,7 @@ import (
 
 type Activities struct {
 	runner    FlowRunner
+	prompter  AgentPrompter
 	heartbeat time.Duration
 }
 
@@ -45,6 +46,23 @@ func (a *Activities) ProcessFlowInput(ctx context.Context, args ProcessInputArgs
 
 	defer a.keepAlive(ctx, mark)()
 	return classify(a.runner.ProcessFlowInput(ctx, req))
+}
+
+// RenderAgentPrompt renders on the flows queue because only this worker can
+// build the user prompter. A render failure is non-retryable: the workflow
+// falls back to the child workflow's own default prompt rather than parking
+// the flow on a template that cannot render.
+func (a *Activities) RenderAgentPrompt(ctx context.Context, req PromptRenderRequest) (RenderedPrompt, error) {
+	defer a.keepAlive(ctx, nil)()
+	if a.prompter == nil {
+		return RenderedPrompt{}, temporal.NewNonRetryableApplicationError(
+			"no agent prompter registered on the flows worker", "RenderUnavailable", nil)
+	}
+	res, err := a.prompter.RenderAgentPrompt(ctx, req)
+	if err != nil {
+		return RenderedPrompt{}, temporal.NewNonRetryableApplicationError(err.Error(), "RenderFailed", err)
+	}
+	return res, nil
 }
 
 func (a *Activities) keepAlive(ctx context.Context, details any) (stop func()) {

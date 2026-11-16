@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"pentagi/pkg/config"
 	"pentagi/pkg/database"
 	"pentagi/pkg/docker"
 	obs "pentagi/pkg/observability"
@@ -251,6 +252,7 @@ func newCreatingController(t *testing.T, buildErr error) *creatingController {
 	c.fc = &flowController{
 		db:     q,
 		mx:     &sync.Mutex{},
+		cfg:    &config.Config{},
 		flows:  map[int64]*flowEntry{},
 		subs:   &cascadeFakeSubscriptions{pub: pub},
 		docker: &finishFakeDocker{},
@@ -558,8 +560,8 @@ func TestFlows_FinishFlow_WaitsForACommittedPreparation(t *testing.T) {
 			go func() { finished <- c.fc.FinishFlow(context.Background(), reservedFlowID) }()
 
 			select {
-			case <-finished:
-				t.Fatal("finishing a flow whose sandbox is starting answered before the preparation ended")
+			case err := <-finished:
+				t.Fatalf("finishing a flow whose sandbox is starting answered before the preparation ended: %v", err)
 			case <-time.After(100 * time.Millisecond):
 			}
 			close(c.release)

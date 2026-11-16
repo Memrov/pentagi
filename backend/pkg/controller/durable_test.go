@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"pentagi/pkg/adk"
 	"pentagi/pkg/database"
 	"pentagi/pkg/temporal"
 
@@ -323,6 +324,56 @@ func TestDurable_Finish_WaitsForRunningActivity(t *testing.T) {
 
 	require.NoError(t, fw.finish())
 	assert.True(t, task.exited.Load())
+}
+
+// An adk flow's children own their inputs; the task-level recovery path must
+// never touch them even if a recover request is scheduled by mistake.
+func TestDurable_ProcessFlowInput_RecoverSkipsAdkFlow(t *testing.T) {
+	task := &durableTask{id: 9}
+	tasks := &durableTasks{tasks: []TaskWorker{task}}
+	fw, runner := newDurableWorker(t, tasks, &recordingEngine{}, 5, 9)
+	fw.flowCtx.Engine = database.FlowEngineAdk
+
+	err := runner.ProcessFlowInput(context.Background(), temporal.InputRequest{
+		FlowID: reservedFlowID, Input: "scan", Recover: true, LastTaskID: 5,
+	})
+
+	require.NoError(t, err)
+	assert.Empty(t, tasks.created)
+	assert.Equal(t, int32(0), task.runs.Load())
+}
+
+type containerQuerier struct {
+	database.Querier
+
+	cnt database.Container
+	err error
+}
+
+func (q *containerQuerier) GetFlowPrimaryContainer(ctx context.Context, _ int64) (database.Container, error) {
+	if err := ctx.Err(); err != nil {
+		return database.Container{}, err
+	}
+	return q.cnt, q.err
+}
+
+func TestDurable_NewADKSandboxResolver_BindsFlowContainer(t *testing.T) {
+	resolve := NewADKSandboxResolver(
+		&containerQuerier{cnt: database.Container{Name: "pentagi-flow-7-worker"}}, nil)
+
+	sb, err := resolve(context.Background(), 7)
+	require.NoError(t, err)
+
+	ds, ok := sb.(*adk.DockerSandbox)
+	require.True(t, ok, "resolver must return a docker sandbox, got %T", sb)
+	assert.Equal(t, "pentagi-flow-7-worker", ds.Container)
+}
+
+func TestDurable_NewADKSandboxResolver_PropagatesLookupError(t *testing.T) {
+	resolve := NewADKSandboxResolver(&containerQuerier{err: errors.New("no row")}, nil)
+
+	_, err := resolve(context.Background(), 7)
+	assert.ErrorContains(t, err, "failed to get flow 7 primary container")
 }
 
 func TestDurable_ProcessFlowInput_RecoverWaitsForRunningAttempt(t *testing.T) {

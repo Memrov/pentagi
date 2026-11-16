@@ -146,6 +146,16 @@ func reserveFlow(ctx context.Context, fwc newFlowWorkerCtx) (database.Flow, erro
 	ctx, span := obs.Observer.NewSpan(ctx, obs.SpanKindInternal, "controller.reserveFlow")
 	defer span.End()
 
+	engine := database.FlowEngineLegacy
+	switch fwc.cfg.FlowEngine {
+	case "", string(database.FlowEngineLegacy):
+	case string(database.FlowEngineAdk):
+		engine = database.FlowEngineAdk
+	default:
+		logrus.WithContext(ctx).WithField("flow_engine", fwc.cfg.FlowEngine).
+			Warn("unknown FLOW_ENGINE, creating a legacy flow")
+	}
+
 	flow, err := fwc.db.CreateFlow(ctx, database.CreateFlowParams{
 		Title:              "untitled",
 		Status:             database.FlowStatusCreated,
@@ -156,6 +166,7 @@ func reserveFlow(ctx context.Context, fwc newFlowWorkerCtx) (database.Flow, erro
 		ToolCallIDTemplate: cast.ToolCallIDTemplate,
 		Functions:          []byte("{}"),
 		UserID:             fwc.userID,
+		Engine:             engine,
 	})
 	if err != nil {
 		obs.LogErrorOrCancel(logrus.WithContext(ctx), err, "failed to create flow in DB")
@@ -272,6 +283,7 @@ func buildFlowWorker(
 		UserID:     fwc.userID,
 		FlowID:     flow.ID,
 		TraceID:    observation.TraceID(),
+		Engine:     flow.Engine,
 		Executor:   executor,
 		Provider:   flowProvider,
 		Publisher:  pub,
@@ -442,6 +454,7 @@ func LoadFlowWorker(ctx context.Context, flow database.Flow, fwc flowWorkerCtx) 
 		UserID:     flow.UserID,
 		FlowID:     flow.ID,
 		TraceID:    observation.TraceID(),
+		Engine:     flow.Engine,
 		Executor:   executor,
 		Provider:   flowProvider,
 		Publisher:  pub,

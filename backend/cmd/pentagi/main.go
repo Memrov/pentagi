@@ -17,6 +17,7 @@ import (
 	_ "time/tzdata"
 
 	"pentagi/migrations"
+	"pentagi/pkg/adk"
 	"pentagi/pkg/config"
 	"pentagi/pkg/controller"
 	"pentagi/pkg/database"
@@ -32,6 +33,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/lib/pq"
+	mobyclient "github.com/moby/moby/client"
 	"github.com/pressly/goose/v3"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
@@ -240,6 +242,13 @@ func main() {
 		}
 		defer durable.Close()
 		flowOpts = append(flowOpts, controller.WithFlowEngine(durable))
+		durable.SetEngineLookup(func(ctx context.Context, flowID int64) (string, error) {
+			flow, err := queries.GetFlow(ctx, flowID)
+			if err != nil {
+				return "", fmt.Errorf("failed to get flow %d: %w", flowID, err)
+			}
+			return string(flow.Engine), nil
+		})
 	}
 	flowController := controller.NewFlowController(queries, cfg, client, providers, subscriptions, flowOpts...)
 
@@ -254,6 +263,14 @@ func main() {
 		}
 		if err := durable.StartWorker(runner); err != nil {
 			logrus.WithError(err).Fatal("Temporal worker startup failed")
+		}
+		if cfg.ADKWorkerEnabled {
+			// A warning rather than fatal: Temporal deployments without ADK_*
+			// envs must still boot, and a missing worker leaves engine=adk
+			// inputs dropped with an error in the workflow log.
+			if err := startADKWorker(durable, queries, cfg); err != nil {
+				logrus.WithError(err).Warn("ADK worker disabled")
+			}
 		}
 	}
 
@@ -302,4 +319,50 @@ func main() {
 	}
 
 	logrus.Info("Application shutdown completed successfully")
+}
+
+// startADKWorker builds the second Temporal worker on the scoped adk queue:
+// the pentester child workflow, its tool activities and the model activities
+// behind the plugin. The dispatch policy is published only once the worker
+// can actually serve the queue, so a misconfigured ADK setup drops inputs
+// with a workflow error instead of parking them on a queue nobody polls.
+func startADKWorker(durable *temporal.Client, queries *database.Queries, cfg *config.Config) error {
+	adkCfg, err := adk.LoadConfig()
+	if err != nil {
+		return err
+	}
+	plugin, err := adk.WorkerPlugin(adkCfg)
+	if err != nil {
+		return err
+	}
+
+	var sandbox adk.Sandbox = adk.LocalSandbox{}
+	var resolver func(context.Context, int64) (adk.Sandbox, error)
+	if adkCfg.Sandbox == "docker" {
+		mobyCli, err := mobyclient.New(mobyclient.FromEnv)
+		if err != nil {
+			return fmt.Errorf("failed to initialize adk docker client: %w", err)
+		}
+		exec := adk.NewDockerExecClient(mobyCli)
+		sandbox = &adk.DockerSandbox{Client: exec, Container: adkCfg.SandboxContainer}
+		resolver = controller.NewADKSandboxResolver(queries, exec)
+	}
+
+	var payload adk.PayloadStore = adk.NewMemoryPayloadStore()
+	if adkCfg.PayloadBucket != "" {
+		if payload, err = adk.NewS3PayloadStore(context.Background(), adkCfg.PayloadBucket, adkCfg.PayloadPrefix); err != nil {
+			return err
+		}
+	}
+
+	acts := adk.NewActivities(sandbox, payload, adkCfg.PayloadThreshold, adkCfg.ToolTimeout())
+	acts.FlowBound = adkCfg.FlowBound
+	acts.SandboxFor = resolver
+
+	durable.SetADKPolicy(temporal.ADKPolicy{
+		TaskQueue:          cfg.ScopedName(adkCfg.TaskQueue),
+		Model:              adkCfg.ModelName,
+		ToolTimeoutSeconds: adkCfg.ToolTimeoutSeconds,
+	})
+	return durable.StartADKWorker(acts, plugin)
 }

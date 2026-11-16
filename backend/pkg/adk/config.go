@@ -25,8 +25,8 @@ type Config struct {
 	TaskQueue string `env:"ADK_TASK_QUEUE" envDefault:"pentagi-adk"`
 
 	// Sandbox selects the command backend: "local" runs on the host (development
-	// only, unsandboxed), "docker" execs into the container named by
-	// SandboxContainer.
+	// only, unsandboxed), "docker" execs into a container — SandboxContainer is
+	// the fallback for runs whose workflow id does not resolve to a flow.
 	Sandbox          string `env:"ADK_SANDBOX" envDefault:"local"`
 	SandboxContainer string `env:"ADK_SANDBOX_CONTAINER"`
 
@@ -57,9 +57,6 @@ func (c *Config) Validate() error {
 	case "local", "docker":
 	default:
 		return fmt.Errorf("ADK_SANDBOX must be local or docker, got %q", c.Sandbox)
-	}
-	if c.Sandbox == "docker" && c.SandboxContainer == "" {
-		return fmt.Errorf("ADK_SANDBOX_CONTAINER is required when ADK_SANDBOX=docker")
 	}
 	if c.PayloadThreshold <= 0 {
 		return fmt.Errorf("ADK_PAYLOAD_THRESHOLD must be positive, got %d", c.PayloadThreshold)

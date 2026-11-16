@@ -224,6 +224,12 @@ func NewDockerSandbox(container string) (*DockerSandbox, error) {
 	return &DockerSandbox{Client: mobyExec{cli: cli}, Container: container}, nil
 }
 
+// NewDockerExecClient adapts a bare moby client, so wiring that resolves a
+// sandbox per flow shares one daemon connection across all of them.
+func NewDockerExecClient(cli *client.Client) DockerExecClient {
+	return mobyExec{cli: cli}
+}
+
 func (s *DockerSandbox) Exec(ctx context.Context, argv []string, opts ExecOptions) (ExecResult, error) {
 	if len(argv) == 0 {
 		return ExecResult{}, nonRetryable("empty argv")

@@ -316,6 +316,17 @@ type Config struct {
 	TemporalHeartbeatTimeout int    `env:"TEMPORAL_HEARTBEAT_TIMEOUT" envDefault:"60"`
 	TemporalMaxAttempts      int    `env:"TEMPORAL_MAX_ATTEMPTS" envDefault:"10"`
 
+	// FlowEngine selects the executor stamped onto new flow rows: "legacy"
+	// runs inputs through the in-process agent chain, "adk" dispatches each
+	// one to a child pentagi.adk.PentesterWorkflow. Anything else normalizes
+	// to "legacy" where the row is created.
+	FlowEngine string `env:"FLOW_ENGINE" envDefault:"legacy"`
+
+	// ADKWorkerEnabled starts the ADK tool/model worker in this process when
+	// Temporal is enabled. Its queue and model settings come from the ADK_*
+	// env block in pkg/adk.
+	ADKWorkerEnabled bool `env:"ADK_WORKER_ENABLED" envDefault:"true"`
+
 	// === Agent Execution Monitoring ===
 	ExecutionMonitorEnabled        bool `env:"EXECUTION_MONITOR_ENABLED" envDefault:"false"`
 	ExecutionMonitorSameToolLimit  int  `env:"EXECUTION_MONITOR_SAME_TOOL_LIMIT" envDefault:"5"`

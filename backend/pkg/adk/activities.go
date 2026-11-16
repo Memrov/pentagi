@@ -40,6 +40,11 @@ type Activities struct {
 	// stop-command sweep can kill what this workflow started; unset keeps
 	// every command unowned via docker.SandboxCommand.
 	FlowBound bool
+	// SandboxFor resolves the sandbox for an activity attempt whose workflow
+	// id parses as a FlowWorkflow child; nil — or an unparseable id — keeps
+	// the shared sandbox, which is what binds production tools to the flow's
+	// primary container without this package knowing flow rows.
+	SandboxFor func(ctx context.Context, flowID int64) (Sandbox, error)
 }
 
 func NewActivities(sandbox Sandbox, payload PayloadStore, threshold int, defTimeout time.Duration) *Activities {
@@ -187,6 +192,7 @@ func (a *Activities) HttpxProbe(ctx context.Context, in HttpxProbeInput) (ToolRe
 // their point is to outlive the call that started them.
 func (a *Activities) execSandboxed(ctx context.Context, argv []string, opts ExecOptions) (ExecResult, error) {
 	defer startHeartbeat(ctx)()
+	sb := a.sandbox
 	if activity.IsActivity(ctx) && !opts.Detach {
 		if d := activity.GetInfo(ctx).Deadline; !d.IsZero() {
 			if remaining := time.Until(d) - 2*toolHeartbeatInterval; opts.Timeout <= 0 || remaining < opts.Timeout {
@@ -194,7 +200,16 @@ func (a *Activities) execSandboxed(ctx context.Context, argv []string, opts Exec
 			}
 		}
 	}
-	return a.sandbox.Exec(ctx, argv, opts)
+	if a.SandboxFor != nil && activity.IsActivity(ctx) {
+		if flowID, ok := FlowIDFromWorkflowID(activity.GetInfo(ctx).WorkflowExecution.ID); ok {
+			resolved, err := a.SandboxFor(ctx, flowID)
+			if err != nil {
+				return ExecResult{}, err
+			}
+			sb = resolved
+		}
+	}
+	return sb.Exec(ctx, argv, opts)
 }
 
 // exec is the generic tool tail: sandboxed call plus the unformatted output

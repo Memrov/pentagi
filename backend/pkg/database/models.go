@@ -146,6 +146,48 @@ func (ns NullContainerType) Value() (driver.Value, error) {
 	return string(ns.ContainerType), nil
 }
 
+type FlowEngine string
+
+const (
+	FlowEngineLegacy FlowEngine = "legacy"
+	FlowEngineAdk    FlowEngine = "adk"
+)
+
+func (e *FlowEngine) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = FlowEngine(s)
+	case string:
+		*e = FlowEngine(s)
+	default:
+		return fmt.Errorf("unsupported scan type for FlowEngine: %T", src)
+	}
+	return nil
+}
+
+type NullFlowEngine struct {
+	FlowEngine FlowEngine `json:"flow_engine"`
+	Valid      bool       `json:"valid"` // Valid is true if FlowEngine is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullFlowEngine) Scan(value interface{}) error {
+	if value == nil {
+		ns.FlowEngine, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.FlowEngine.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullFlowEngine) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.FlowEngine), nil
+}
+
 type FlowStatus string
 
 const (
@@ -951,6 +993,7 @@ type Flow struct {
 	TraceID            sql.NullString  `json:"trace_id"`
 	ModelProviderType  ProviderType    `json:"model_provider_type"`
 	ToolCallIDTemplate string          `json:"tool_call_id_template"`
+	Engine             FlowEngine      `json:"engine"`
 }
 
 type FlowTemplate struct {

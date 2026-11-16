@@ -17,6 +17,9 @@ const (
 	FlowWorkflowName     = "pentagi.FlowWorkflow"
 	ResumeFlowActivity   = "pentagi.ResumeFlow"
 	ProcessInputActivity = "pentagi.ProcessFlowInput"
+	// RenderPromptActivity renders an agent's prompt pair where the DB and
+	// the user prompter live; workflow code cannot reach either.
+	RenderPromptActivity = "pentagi.RenderAgentPrompt"
 
 	SignalInput  = "input"
 	SignalFinish = "finish"
@@ -24,6 +27,16 @@ const (
 
 	errTypeFlowClosed = "FlowClosed"
 )
+
+// Engine values mirror the FLOW_ENGINE enum on the flows row.
+const (
+	EngineLegacy = "legacy"
+	EngineAdk    = "adk"
+)
+
+// AgentTypePentester is the only agent type RenderPromptActivity serves; it
+// maps to the pentester/question_pentester prompt pair.
+const AgentTypePentester = "pentester"
 
 var (
 	// ErrFlowClosed is returned by a FlowRunner for a flow that was finished
@@ -63,13 +76,19 @@ type FlowRunner interface {
 	ProcessFlowInput(ctx context.Context, req InputRequest) error
 }
 
-// FlowParams is the workflow input. Pending carries inputs across
-// continue-as-new.
+// FlowParams is the workflow input. Pending carries queued inputs and
+// Processed the child-id counter across continue-as-new.
 type FlowParams struct {
 	FlowID  int64
 	Resume  bool
+	Engine  string
 	Pending []string
-	Policy  ActivityPolicy
+	// Processed feeds the deterministic child workflow id, so it must never
+	// restart at zero on a continued run.
+	Processed  int
+	LastResult string
+	Policy     ActivityPolicy
+	ADK        ADKPolicy
 }
 
 // ActivityPolicy is part of the workflow input rather than read from the
@@ -80,11 +99,39 @@ type ActivityPolicy struct {
 	MaxAttempts  int32
 }
 
-type FlowState struct {
+// ADKPolicy is the engine=adk dispatch config, carried in params for the same
+// determinism reason as ActivityPolicy.
+type ADKPolicy struct {
+	TaskQueue          string
+	Model              string
+	ToolTimeoutSeconds int
+}
+
+// PromptRenderRequest asks the flows worker for an agent's prompt pair.
+type PromptRenderRequest struct {
 	FlowID    int64
-	Running   bool
-	Pending   int
-	Processed int
+	AgentType string
+	Input     string
+}
+
+type RenderedPrompt struct {
+	Instruction string
+	Question    string
+}
+
+// AgentPrompter is the render capability behind RenderPromptActivity; it is
+// usually the same runner that serves FlowRunner.
+type AgentPrompter interface {
+	RenderAgentPrompt(ctx context.Context, req PromptRenderRequest) (RenderedPrompt, error)
+}
+
+type FlowState struct {
+	FlowID     int64
+	Engine     string
+	Running    bool
+	Pending    int
+	Processed  int
+	LastResult string
 }
 
 type ProcessInputArgs struct {

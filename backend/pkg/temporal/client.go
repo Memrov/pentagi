@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"pentagi/pkg/adk"
 	"pentagi/pkg/config"
 
 	enumspb "go.temporal.io/api/enums/v1"
@@ -23,9 +24,15 @@ import (
 type Client struct {
 	client    client.Client
 	worker    worker.Worker
+	adkWorker worker.Worker
 	taskQueue string
 	idPrefix  string
 	policy    ActivityPolicy
+	adk       *ADKPolicy
+	// engineOf reads the flow row's engine where a start or signal must stamp
+	// it onto the workflow; a missing or failing lookup yields legacy, the
+	// engine every pre-column row runs.
+	engineOf func(context.Context, int64) (string, error)
 }
 
 // Dial connects to the Temporal frontend. The task queue and workflow ids
@@ -53,6 +60,18 @@ func Dial(cfg *config.Config) (*Client, error) {
 	}, nil
 }
 
+// SetEngineLookup installs the row-level engine resolver; without it every
+// flow is stamped legacy.
+func (c *Client) SetEngineLookup(fn func(context.Context, int64) (string, error)) {
+	c.engineOf = fn
+}
+
+// SetADKPolicy configures child dispatch for engine=adk flows; the task queue
+// must already carry the tenant prefix.
+func (c *Client) SetADKPolicy(policy ADKPolicy) {
+	c.adk = &policy
+}
+
 func (c *Client) WorkflowID(flowID int64) string {
 	return fmt.Sprintf("%spentagi-flow-%d", c.idPrefix, flowID)
 }
@@ -65,8 +84,12 @@ func (c *Client) StartWorker(runner FlowRunner) error {
 	w.RegisterWorkflowWithOptions(FlowWorkflow, workflow.RegisterOptions{Name: FlowWorkflowName})
 
 	acts := NewActivities(runner, max(c.policy.Heartbeat/3, time.Second))
+	if prompter, ok := runner.(AgentPrompter); ok {
+		acts.prompter = prompter
+	}
 	w.RegisterActivityWithOptions(acts.ResumeFlow, activity.RegisterOptions{Name: ResumeFlowActivity})
 	w.RegisterActivityWithOptions(acts.ProcessFlowInput, activity.RegisterOptions{Name: ProcessInputActivity})
+	w.RegisterActivityWithOptions(acts.RenderAgentPrompt, activity.RegisterOptions{Name: RenderPromptActivity})
 
 	if err := w.Start(); err != nil {
 		return fmt.Errorf("failed to start temporal worker on %s: %w", c.taskQueue, err)
@@ -76,9 +99,30 @@ func (c *Client) StartWorker(runner FlowRunner) error {
 	return nil
 }
 
+// StartADKWorker polls the ADK queue in the same process: the pentester child
+// workflow, its tool activities, and the model activities the plugins carry.
+func (c *Client) StartADKWorker(acts *adk.Activities, plugins ...worker.Plugin) error {
+	if c.adk == nil || c.adk.TaskQueue == "" {
+		return fmt.Errorf("adk dispatch is not configured")
+	}
+	w := worker.New(c.client, c.adk.TaskQueue, worker.Options{Plugins: plugins})
+	adk.RegisterWorkflow(w)
+	acts.Register(w)
+
+	if err := w.Start(); err != nil {
+		return fmt.Errorf("failed to start adk worker on %s: %w", c.adk.TaskQueue, err)
+	}
+	c.adkWorker = w
+
+	return nil
+}
+
 func (c *Client) Close() {
 	if c.worker != nil {
 		c.worker.Stop()
+	}
+	if c.adkWorker != nil {
+		c.adkWorker.Stop()
 	}
 	c.client.Close()
 }
@@ -86,7 +130,7 @@ func (c *Client) Close() {
 // StartFlow resumes the unfinished tasks of a flow in a new workflow, or does
 // nothing if its workflow is already running.
 func (c *Client) StartFlow(ctx context.Context, flowID int64) error {
-	_, err := c.client.ExecuteWorkflow(ctx, c.startOptions(flowID), FlowWorkflowName, c.params(flowID))
+	_, err := c.client.ExecuteWorkflow(ctx, c.startOptions(flowID), FlowWorkflowName, c.params(ctx, flowID))
 	if err != nil {
 		return fmt.Errorf("failed to start workflow for flow %d: %w", flowID, err)
 	}
@@ -97,7 +141,7 @@ func (c *Client) StartFlow(ctx context.Context, flowID int64) error {
 // it durable; it does not wait for the input to be processed.
 func (c *Client) SignalInput(ctx context.Context, flowID int64, input string) error {
 	_, err := c.client.SignalWithStartWorkflow(ctx, c.WorkflowID(flowID), SignalInput, input,
-		c.startOptions(flowID), FlowWorkflowName, c.params(flowID))
+		c.startOptions(flowID), FlowWorkflowName, c.params(ctx, flowID))
 	if err != nil {
 		return fmt.Errorf("failed to signal input to flow %d: %w", flowID, err)
 	}
@@ -133,6 +177,18 @@ func (c *Client) startOptions(flowID int64) client.StartWorkflowOptions {
 	}
 }
 
-func (c *Client) params(flowID int64) FlowParams {
-	return FlowParams{FlowID: flowID, Resume: true, Policy: c.policy}
+func (c *Client) params(ctx context.Context, flowID int64) FlowParams {
+	params := FlowParams{FlowID: flowID, Resume: true, Engine: EngineLegacy, Policy: c.policy}
+	if c.engineOf != nil {
+		engine, err := c.engineOf(ctx, flowID)
+		if err != nil {
+			slog.Warn("failed to read flow engine, defaulting to legacy", "flow_id", flowID, "error", err)
+		} else if engine != "" {
+			params.Engine = engine
+		}
+	}
+	if params.Engine == EngineAdk && c.adk != nil {
+		params.ADK = *c.adk
+	}
+	return params
 }

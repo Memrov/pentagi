@@ -2016,8 +2016,12 @@ With `TEMPORAL_ENABLED=true` each flow is driven by a Temporal workflow instead 
 | `TemporalActivityTimeout` | `TEMPORAL_ACTIVITY_TIMEOUT` | `86400` seconds | Upper bound on one task run |
 | `TemporalHeartbeatTimeout` | `TEMPORAL_HEARTBEAT_TIMEOUT` | `60` seconds | How long a silent run is trusted before Temporal retries it |
 | `TemporalMaxAttempts` | `TEMPORAL_MAX_ATTEMPTS` | `10` | Attempts per input before the workflow moves to the next one |
+| `FlowEngine` | `FLOW_ENGINE` | `legacy` | Engine stamped on new flow rows: `legacy` runs the in-process agent chain, `adk` runs each input as a child ADK workflow |
+| `ADKWorkerEnabled` | `ADK_WORKER_ENABLED` | `true` | Start the in-process ADK tool/model worker when Temporal is enabled |
 
 For local development run `temporal server start-dev` (UI on `http://localhost:8233`), or start the overlay with `docker compose -f docker-compose.yml -f docker-compose-temporal.yml up -d` and set `TEMPORAL_HOST_PORT=temporal:7233`. The overlay runs the single-process dev server with a SQLite file; use a production Temporal cluster or Temporal Cloud for real deployments.
+
+An `adk`-engine flow dispatches each input to a child `pentagi.adk.PentesterWorkflow` on the scoped `ADK_TASK_QUEUE` (`<tenant>-pentagi-adk`) instead of `ProcessFlowInput`; the worker serving that queue lives in the same process and is configured by the `ADK_*` variables (`ADK_API_KEY`, `ADK_BASE_URL`, `ADK_MODEL_NAME`, `ADK_SANDBOX`, `ADK_SANDBOX_CONTAINER`, `ADK_PAYLOAD_*`, `ADK_TOOL_TIMEOUT`, `ADK_FLOW_BOUND`) — see `backend/docs/adk-spike.md` for their meaning. The child binds its tool calls to the flow's primary container when `ADK_SANDBOX=docker`.
 
 ### How a Durable Flow Runs
 

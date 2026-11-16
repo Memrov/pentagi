@@ -3,12 +3,17 @@ package temporal
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
+
+	"pentagi/pkg/adk"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/workflow"
 )
@@ -145,4 +150,174 @@ func TestWorkflow_FlowWorkflow_QueryReportsQueuedInputs(t *testing.T) {
 
 	require.True(t, env.IsWorkflowCompleted())
 	assert.Equal(t, FlowState{FlowID: 7, Running: true, Pending: 1}, state)
+}
+
+type childRun struct {
+	id  string
+	req adk.PentestRequest
+}
+
+// newAdkEnv registers the flow workflow, the prompt render activity stub and
+// a pentester child stub whose runs land in the returned slice.
+func newAdkEnv(
+	t *testing.T,
+	render func(context.Context, PromptRenderRequest) (RenderedPrompt, error),
+	child func(workflow.Context, adk.PentestRequest) (adk.PentestResult, error),
+) (*testsuite.TestWorkflowEnvironment, *[]childRun) {
+	t.Helper()
+
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: "pentagi-flow-7"})
+	env.RegisterWorkflowWithOptions(FlowWorkflow, workflow.RegisterOptions{Name: FlowWorkflowName})
+	env.RegisterActivityWithOptions(func(context.Context, int64) error { return nil },
+		activity.RegisterOptions{Name: ResumeFlowActivity})
+	env.RegisterActivityWithOptions(render, activity.RegisterOptions{Name: RenderPromptActivity})
+
+	var (
+		mu   sync.Mutex
+		runs []childRun
+	)
+	env.RegisterWorkflowWithOptions(func(ctx workflow.Context, req adk.PentestRequest) (adk.PentestResult, error) {
+		res, err := child(ctx, req)
+		mu.Lock()
+		runs = append(runs, childRun{workflow.GetInfo(ctx).WorkflowExecution.ID, req})
+		mu.Unlock()
+		return res, err
+	}, workflow.RegisterOptions{Name: adk.PentesterWorkflowName})
+
+	return env, &runs
+}
+
+func renderOK(_ context.Context, req PromptRenderRequest) (RenderedPrompt, error) {
+	return RenderedPrompt{Instruction: "rendered instruction", Question: "rendered " + req.Input}, nil
+}
+
+func adkParams(pending ...string) FlowParams {
+	return FlowParams{
+		FlowID:  7,
+		Engine:  EngineAdk,
+		Pending: pending,
+		Policy:  testPolicy,
+		ADK:     ADKPolicy{TaskQueue: "pentagi-adk", Model: "adk-model", ToolTimeoutSeconds: 60},
+	}
+}
+
+func TestWorkflow_FlowWorkflow_AdkEngineDispatchesInputsToChildWorkflows(t *testing.T) {
+	env, runs := newAdkEnv(t, renderOK, func(ctx workflow.Context, _ adk.PentestRequest) (adk.PentestResult, error) {
+		return adk.PentestResult{EventCount: 4, HackResult: &adk.HackResult{Success: true, Result: "done"}}, nil
+	})
+	env.RegisterDelayedCallback(func() { env.SignalWorkflow(SignalFinish, nil) }, time.Minute)
+
+	env.ExecuteWorkflow(FlowWorkflowName, adkParams("scan target"))
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	require.Len(t, *runs, 1)
+	run := (*runs)[0]
+	assert.Equal(t, "pentagi-flow-7-input-0", run.id)
+	assert.Equal(t, adk.PentestRequest{
+		Task:               "scan target",
+		Model:              "adk-model",
+		Instruction:        "rendered instruction",
+		Question:           "rendered scan target",
+		ToolTimeoutSeconds: 60,
+	}, run.req)
+}
+
+func TestWorkflow_FlowWorkflow_AdkEngineRecordsResultSummaryInState(t *testing.T) {
+	env, _ := newAdkEnv(t, renderOK, func(ctx workflow.Context, _ adk.PentestRequest) (adk.PentestResult, error) {
+		if err := workflow.Sleep(ctx, 30*time.Second); err != nil {
+			return adk.PentestResult{}, err
+		}
+		return adk.PentestResult{EventCount: 4, HackResult: &adk.HackResult{Success: true, Result: "done"}}, nil
+	})
+
+	var state FlowState
+	env.RegisterDelayedCallback(func() {
+		val, err := env.QueryWorkflow(QueryState)
+		require.NoError(t, err)
+		require.NoError(t, val.Get(&state))
+		env.SignalWorkflow(SignalFinish, nil)
+	}, time.Minute)
+
+	env.ExecuteWorkflow(FlowWorkflowName, adkParams("scan target"))
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	assert.Equal(t, "adk", state.Engine)
+	assert.Equal(t, 1, state.Processed)
+	assert.Equal(t, `{"event_count":4,"hack_result":true,"hack_result_success":true}`, state.LastResult)
+}
+
+func TestWorkflow_FlowWorkflow_AdkEngineBuffersInputsWhileChildRuns(t *testing.T) {
+	env, runs := newAdkEnv(t, renderOK, func(ctx workflow.Context, _ adk.PentestRequest) (adk.PentestResult, error) {
+		if err := workflow.Sleep(ctx, 30*time.Second); err != nil {
+			return adk.PentestResult{}, err
+		}
+		return adk.PentestResult{EventCount: 1}, nil
+	})
+
+	var state FlowState
+	env.RegisterDelayedCallback(func() { env.SignalWorkflow(SignalInput, "two") }, 15*time.Second)
+	env.RegisterDelayedCallback(func() {
+		val, err := env.QueryWorkflow(QueryState)
+		require.NoError(t, err)
+		require.NoError(t, val.Get(&state))
+	}, 20*time.Second)
+	env.RegisterDelayedCallback(func() { env.SignalWorkflow(SignalFinish, nil) }, 2*time.Minute)
+
+	env.ExecuteWorkflow(FlowWorkflowName, adkParams("one"))
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	require.Len(t, *runs, 2)
+	assert.Equal(t, "pentagi-flow-7-input-0", (*runs)[0].id)
+	assert.Equal(t, "one", (*runs)[0].req.Task)
+	assert.Equal(t, "pentagi-flow-7-input-1", (*runs)[1].id)
+	assert.Equal(t, "two", (*runs)[1].req.Task)
+	assert.True(t, state.Running)
+	assert.Equal(t, 1, state.Pending)
+}
+
+func TestWorkflow_FlowWorkflow_AdkEngineFinishCancelsRunningChild(t *testing.T) {
+	cancelled := make(chan error, 1)
+	env, runs := newAdkEnv(t, renderOK, func(ctx workflow.Context, _ adk.PentestRequest) (adk.PentestResult, error) {
+		ctx.Done().Receive(ctx, nil)
+		err := ctx.Err()
+		cancelled <- err
+		return adk.PentestResult{}, err
+	})
+	env.RegisterDelayedCallback(func() { env.SignalWorkflow(SignalFinish, nil) }, 30*time.Second)
+
+	env.ExecuteWorkflow(FlowWorkflowName, adkParams("run"))
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	require.Len(t, *runs, 1)
+	select {
+	case err := <-cancelled:
+		assert.True(t, temporal.IsCanceledError(err), "expected a canceled error, got %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("the running child workflow was never cancelled")
+	}
+}
+
+func TestWorkflow_FlowWorkflow_AdkEngineRenderFailureFallsBackToChildDefaults(t *testing.T) {
+	env, runs := newAdkEnv(t,
+		func(context.Context, PromptRenderRequest) (RenderedPrompt, error) {
+			return RenderedPrompt{}, errors.New("template exploded")
+		},
+		func(_ workflow.Context, _ adk.PentestRequest) (adk.PentestResult, error) {
+			return adk.PentestResult{EventCount: 1}, nil
+		})
+	env.RegisterDelayedCallback(func() { env.SignalWorkflow(SignalFinish, nil) }, time.Minute)
+
+	env.ExecuteWorkflow(FlowWorkflowName, adkParams("scan"))
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	require.Len(t, *runs, 1)
+	assert.Equal(t, "", (*runs)[0].req.Instruction)
+	assert.Equal(t, "", (*runs)[0].req.Question)
 }

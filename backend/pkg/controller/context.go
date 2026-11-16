@@ -23,6 +23,9 @@ type FlowContext struct {
 	UserID  int64
 	FlowID  int64
 	TraceID string
+	// Engine mirrors the flows row: adk flows run inside child workflows, so
+	// the durable runner reads it to keep them off task-level recovery.
+	Engine database.FlowEngine
 
 	Executor  tools.FlowToolsExecutor
 	Provider  providers.FlowProvider

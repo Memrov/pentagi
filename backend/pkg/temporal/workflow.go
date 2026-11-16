@@ -1,7 +1,11 @@
 package temporal
 
 import (
+	"encoding/json"
+	"fmt"
 	"time"
+
+	"pentagi/pkg/adk"
 
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
@@ -15,7 +19,12 @@ func FlowWorkflow(ctx workflow.Context, params FlowParams) error {
 	finishCh := workflow.GetSignalChannel(ctx, SignalFinish)
 
 	pending := append([]string(nil), params.Pending...)
-	state := FlowState{FlowID: params.FlowID}
+	state := FlowState{
+		FlowID:     params.FlowID,
+		Engine:     params.Engine,
+		Processed:  params.Processed,
+		LastResult: params.LastResult,
+	}
 	finished := false
 
 	err := workflow.SetQueryHandler(ctx, QueryState, func() (FlowState, error) {
@@ -36,10 +45,12 @@ func FlowWorkflow(ctx workflow.Context, params FlowParams) error {
 		finished = true
 	}
 
-	// A finish signal cancels the activity in flight and waits for it to
+	// A finish signal cancels the work in flight and waits for it to
 	// unwind, so the run is not left going on a flow the user has closed.
-	run := func(name string, arg any) {
-		actx, cancel := workflow.WithCancel(workflow.WithActivityOptions(ctx, params.Policy.options()))
+	// await returns false when the finish signal won, so a caller chaining
+	// steps can stop before scheduling the next one.
+	await := func(schedule func(workflow.Context) workflow.Future, out any) bool {
+		cctx, cancel := workflow.WithCancel(ctx)
 		defer cancel()
 
 		state.Running = true
@@ -47,11 +58,11 @@ func FlowWorkflow(ctx workflow.Context, params FlowParams) error {
 
 		done := false
 		sel := workflow.NewSelector(ctx)
-		fut := workflow.ExecuteActivity(actx, name, arg)
+		fut := schedule(cctx)
 		sel.AddFuture(fut, func(f workflow.Future) {
 			done = true
-			if err := f.Get(ctx, nil); err != nil {
-				logger.Error("flow activity failed", "activity", name, "flow_id", params.FlowID, "error", err)
+			if err := f.Get(ctx, out); err != nil {
+				logger.Error("flow work failed", "flow_id", params.FlowID, "error", err)
 			}
 		})
 		sel.AddReceive(inputCh, onInput)
@@ -61,8 +72,64 @@ func FlowWorkflow(ctx workflow.Context, params FlowParams) error {
 		}
 		if !done {
 			cancel()
-			_ = fut.Get(ctx, nil)
+			_ = fut.Get(ctx, out)
 		}
+		return done
+	}
+
+	run := func(name string, arg any) {
+		await(func(c workflow.Context) workflow.Future {
+			return workflow.ExecuteActivity(
+				workflow.WithActivityOptions(c, params.Policy.options()), name, arg)
+		}, nil)
+	}
+
+	// One adk input is a child workflow on the adk queue with a deterministic
+	// id built from the processed counter: a replayed parent re-executes the
+	// same id and Temporal answers it from the recorded command instead of
+	// starting a second run of the input, and a child cannot outlive the
+	// parent under the default close policy, so the id can never collide
+	// with a still-running one. The prompts are rendered in an activity
+	// first because the prompter reads the DB.
+	runAdkInput := func(input string) {
+		if params.ADK.TaskQueue == "" {
+			logger.Error("adk engine flow has no adk task queue configured; dropping input",
+				"flow_id", params.FlowID)
+			return
+		}
+
+		req := adk.PentestRequest{
+			Task:               input,
+			Model:              params.ADK.Model,
+			ToolTimeoutSeconds: params.ADK.ToolTimeoutSeconds,
+		}
+
+		var rendered RenderedPrompt
+		if !await(func(c workflow.Context) workflow.Future {
+			return workflow.ExecuteActivity(
+				workflow.WithActivityOptions(c, params.Policy.options()),
+				RenderPromptActivity,
+				PromptRenderRequest{FlowID: params.FlowID, AgentType: AgentTypePentester, Input: input})
+		}, &rendered) {
+			return
+		}
+		req.Instruction = rendered.Instruction
+		req.Question = rendered.Question
+
+		childID := fmt.Sprintf("%s-input-%d", workflow.GetInfo(ctx).WorkflowExecution.ID, state.Processed)
+		var res adk.PentestResult
+		if !await(func(c workflow.Context) workflow.Future {
+			return workflow.ExecuteChildWorkflow(
+				workflow.WithChildOptions(c, workflow.ChildWorkflowOptions{
+					WorkflowID:          childID,
+					TaskQueue:           params.ADK.TaskQueue,
+					WaitForCancellation: true,
+				}),
+				adk.PentesterWorkflowName, req)
+		}, &res) {
+			return
+		}
+		state.LastResult = adkResultSummary(res)
 	}
 
 	if params.Resume {
@@ -88,8 +155,12 @@ func FlowWorkflow(ctx workflow.Context, params FlowParams) error {
 					continue
 				}
 				return workflow.NewContinueAsNewError(ctx, FlowWorkflowName, FlowParams{
-					FlowID: params.FlowID,
-					Policy: params.Policy,
+					FlowID:     params.FlowID,
+					Engine:     params.Engine,
+					Processed:  state.Processed,
+					LastResult: state.LastResult,
+					Policy:     params.Policy,
+					ADK:        params.ADK,
 				})
 			}
 			idle.Select(ctx)
@@ -98,11 +169,34 @@ func FlowWorkflow(ctx workflow.Context, params FlowParams) error {
 
 		input := pending[0]
 		pending = pending[1:]
-		run(ProcessInputActivity, ProcessInputArgs{FlowID: params.FlowID, Input: input})
+		if params.Engine == EngineAdk {
+			runAdkInput(input)
+		} else {
+			run(ProcessInputActivity, ProcessInputArgs{FlowID: params.FlowID, Input: input})
+		}
 		state.Processed++
 	}
 
 	return nil
+}
+
+// adkResultSummary is the compact record FlowState keeps per child run; the
+// answer text stays out of workflow history on purpose.
+func adkResultSummary(res adk.PentestResult) string {
+	summary := struct {
+		EventCount        int  `json:"event_count"`
+		HackResult        bool `json:"hack_result"`
+		HackResultSuccess bool `json:"hack_result_success"`
+	}{
+		EventCount:        res.EventCount,
+		HackResult:        res.HackResult != nil,
+		HackResultSuccess: res.HackResult != nil && res.HackResult.Success,
+	}
+	raw, err := json.Marshal(summary)
+	if err != nil {
+		return fmt.Sprintf(`{"event_count":%d}`, res.EventCount)
+	}
+	return string(raw)
 }
 
 func (p ActivityPolicy) options() workflow.ActivityOptions {

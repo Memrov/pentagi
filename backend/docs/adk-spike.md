@@ -1,6 +1,6 @@
 # ADK Go spike: durable pentester agent
 
-`pkg/adk` evaluates replacing the langchaingo agent loop with Google ADK Go 2.0 while keeping Temporal as the only durability and orchestration layer. It is a spike: nothing in production code paths calls it, and it is exercised through `cmd/adkpentest` and its own tests.
+`pkg/adk` evaluates replacing the langchaingo agent loop with Google ADK Go 2.0 while keeping Temporal as the only durability and orchestration layer. Phase 2 wires it into production behind a per-flow flag: a flow whose `engine` column reads `adk` runs each input as a child `pentagi.adk.PentesterWorkflow` under `pentagi.FlowWorkflow`, while `legacy` flows — the default and every pre-migration row — take the unchanged `pentagi.ProcessFlowInput` path. The `cmd/adkpentest` CLI remains the standalone exercise path.
 
 ## Architecture
 
@@ -70,17 +70,36 @@ export TEMPORAL_API_KEY=...   # enables TLS + API-key auth
 - The prompt seam: `PentesterPromptVars` keys match the production map, tool-name variables appear only for registered tools, and instruction/question overrides reach the model request in both modes.
 - Tool activities heartbeat every 5 s (with elapsed-time details) against a 30 s `HeartbeatTimeout`, and `InvokeModel` gets the same heartbeat timeout plus a bounded retry via `WithModelActivityOptions`, so a dead worker or wedged provider is detected in tens of seconds instead of waiting out `StartToCloseTimeout`; a live worker-restart run on Temporal Cloud confirmed the retry-onto-new-worker path. The exec timeout is clamped to the activity's remaining deadline (detached commands exempt — their point is to outlive the call), and parent cancellation propagates as `context.Canceled` while the tool's own deadline produces the graceful `timed_out` result. Cancellation also kills the whole process group — locally via `Setpgid`, in Docker via a PID marker file and a cleanup exec.
 
+## Production wiring (Phase 2)
+
+The `flows.engine` column (`FLOW_ENGINE` enum: `legacy`, `adk`, default `legacy`) picks the executor per flow. `FLOW_ENGINE` in `pkg/config` stamps new rows at `reserveFlow` time — unknown values normalize to `legacy` — and `cmd/pentagi` resolves the row's engine into `FlowParams` whenever a workflow is started or signalled, falling back to `legacy` when the lookup fails.
+
+`pentagi.FlowWorkflow` stays the durable input sequencer for both engines. For `engine=adk` each dequeued input runs as a child workflow instead of the `ProcessFlowInput` activity:
+
+- `pentagi.RenderAgentPrompt` runs first on the flows queue — the user prompter and the container row are worker-side, so the pentester/`question_pentester` pair renders in an activity through the same `newUserPrompter` path the controller uses. A render failure is non-retryable: the input still dispatches and the child falls back to its built-in default prompt.
+- The child runs on the scoped `ADK_TASK_QUEUE` (`<tenant->pentagi-adk`) as `pentagi.adk.PentesterWorkflow` with the rendered `Instruction`/`Question`, the flow's model and the tool timeout from `FlowParams.ADK` — config values live in params because workflow code cannot read env on replay.
+- The child id is deterministic: `<tenant->pentagi-flow-<flowID>-input-<seq>` where `seq` is the workflow's processed-input counter carried across continue-as-new. Reattachment works through history dedup, not a conflict policy — `workflow.ChildWorkflowOptions` in SDK v1.51 exposes no `WorkflowIDConflictPolicy`, and none is needed: a replayed parent re-executes the same `ExecuteChildWorkflow` command and Temporal answers it from the recorded event, while the default parent-close policy terminates children with their parent so a same-id child cannot still be running when a new parent run arrives.
+- A finish signal cancels the in-flight child context and `WaitForCancellation` waits out its unwind; inputs signalled during a child run buffer in `pending` exactly as they do for the legacy path. A completed child leaves a compact `{"event_count":…,"hack_result":…}` summary on `FlowState.LastResult` — answer text deliberately stays out of history.
+- `durableRecover` short-circuits for adk flows: the InputMark/task-id recovery exists for the legacy task chain only, and child workflows own their own inputs.
+
+The second worker shares the server process: when `TEMPORAL_ENABLED` and `ADK_WORKER_ENABLED` (default `true`) are set, `cmd/pentagi` loads `adk.Config`, registers `PentesterWorkflow`, the four tool activities and the `WorkerPlugin` model activities on the scoped adk queue, and publishes `FlowParams.ADK` only once the worker can actually serve it — a misconfigured `ADK_*` setup logs a warning and leaves adk inputs dropped with a workflow error rather than parked on a queue nobody polls. The model API key never enters workflow history: it lives worker-side in the plugin factory.
+
+Tool activities resolve their sandbox per attempt: an activity whose workflow id parses as a flow child id (`adk.FlowIDFromWorkflowID`) binds a `DockerSandbox` to the flow's primary container via `controller.NewADKSandboxResolver`, and anything else — a CLI spike run, a hand-typed id — falls back to `ADK_SANDBOX_CONTAINER`. `ADK_SANDBOX=docker` is required for that binding; `local` keeps everything on the host for development.
+
 ## Open gaps for the port
 
 Phase 1 closed: the production `terminal`/`file`/`hack_result` tool surface with verbatim schemas and descriptions, terminal timeout/detach/result parity, the `hack_result` loop barrier in both modes, flow-bound command marking, and the rendered-prompt injection seam.
+
+Phase 2 closed: the per-flow engine flag end to end (migration, `FLOW_ENGINE`, row stamping, engine lookup into `FlowParams`), child dispatch on the scoped adk queue with deterministic ids, the `pentagi.RenderAgentPrompt` activity on the production prompt path, the in-process adk worker, flow-bound sandbox resolution, and the adk bypass of task-level recovery.
 
 Remaining:
 
 - Sub-agent tools (`pentester`, `coder`, `searcher`, `advice`, `memorist`, `maintenance`, `search`/`web_search`, guide stores, `graphiti_search`) — `PentesterPromptVars` already maps their variable names; the activities and handlers are not ported.
 - `edit_file` diff application (needs container copy plumbing beyond the exec surface) and `ask`/`ask_user` for durable user interaction beyond the confirmation signal.
-- Event bridge to production observability: ADK events are collected but not yet published as flow logs/termlogs/Langfuse observations.
+- Event bridge to production observability and the UI: ADK events are collected inside the child workflow but never surface as flow logs, termlogs or Langfuse observations, so an adk run is invisible in the flow transcript.
 - The fixer and reflector chains — the tool-call fixer on malformed calls and the post-run reflector are production prompt-driven flows with no ADK equivalent yet.
+- Per-user provider resolution: the adk model is one global `ADK_*` config rather than the flow's configured provider and model, so an adk flow ignores its provider row.
 - Session carry-over across continue-as-new (`googleadk.ExportSession`/`ImportSession`) for long tasks — the workflow is single-run today, and `pentagi.hack_result` state is extracted from events rather than read back from an exported session.
 - Fetching `payload_uri` blobs back when the model needs more than the preview.
-- Binding `DockerSandbox` to the flow's primary container (the flow-bound wrapper is wired; the lifecycle is not), plus mapping PentAGI's task/subtask lifecycle and message chains onto ADK sessions.
+- Mapping PentAGI's task/subtask lifecycle and message chains onto ADK sessions.
 - The authorization guard wiring — `ScopeGuard` stays the isolated seam.

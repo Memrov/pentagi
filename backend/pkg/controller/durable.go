@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"pentagi/pkg/adk"
+	"pentagi/pkg/database"
 	"pentagi/pkg/temporal"
 )
 
@@ -137,10 +139,16 @@ func (fw *flowWorker) runInput(input string) error {
 // again cannot be told apart and is fed twice. With neither, a task left
 // running was fed the input and is resumed, or the attempt left no trace and
 // the input is processed afresh. The state is read under durableMX, after a
-// timed-out attempt still running in this process has ended.
+// timed-out attempt still running in this process has ended. An adk flow
+// never reaches it — child workflows own their inputs — but the guard stays
+// in case one is ever scheduled on the legacy path.
 func (fw *flowWorker) durableRecover(req temporal.InputRequest, lastTaskID func() (int64, error)) error {
 	fw.durableMX.Lock()
 	defer fw.durableMX.Unlock()
+
+	if fw.flowCtx.Engine == database.FlowEngineAdk {
+		return nil
+	}
 
 	last, err := lastTaskID()
 	if err != nil {
@@ -208,4 +216,17 @@ func (fw *flowWorker) start(ctx context.Context) error {
 	fw.wg.Add(1)
 	go fw.worker()
 	return nil
+}
+
+// NewADKSandboxResolver binds adk tool calls to the flow's primary container:
+// the calling activity supplies the flow id parsed out of its own child
+// workflow id, and the container name comes from the row.
+func NewADKSandboxResolver(db database.Querier, exec adk.DockerExecClient) func(context.Context, int64) (adk.Sandbox, error) {
+	return func(ctx context.Context, flowID int64) (adk.Sandbox, error) {
+		cnt, err := db.GetFlowPrimaryContainer(ctx, flowID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get flow %d primary container: %w", flowID, err)
+		}
+		return &adk.DockerSandbox{Client: exec, Container: cnt.Name}, nil
+	}
 }

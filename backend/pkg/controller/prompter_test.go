@@ -5,8 +5,12 @@ import (
 	"errors"
 	"testing"
 
+	"pentagi/pkg/config"
 	"pentagi/pkg/database"
+	"pentagi/pkg/graphiti"
+	"pentagi/pkg/providers"
 	"pentagi/pkg/templates"
+	"pentagi/pkg/temporal"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -100,4 +104,59 @@ func TestPrompter_NewUserPrompter_OverlaysTheUsersPromptsOnTheDefaults(t *testin
 			}
 		})
 	}
+}
+
+type renderFakeQuerier struct {
+	database.Querier
+
+	flow    database.Flow
+	prompts []database.Prompt
+	cnt     database.Container
+	cntErr  error
+}
+
+func (q *renderFakeQuerier) GetFlow(context.Context, int64) (database.Flow, error) {
+	return q.flow, nil
+}
+
+func (q *renderFakeQuerier) GetUserPrompts(context.Context, int64) ([]database.Prompt, error) {
+	return q.prompts, nil
+}
+
+func (q *renderFakeQuerier) GetFlowPrimaryContainer(context.Context, int64) (database.Container, error) {
+	return q.cnt, q.cntErr
+}
+
+type renderFakeProviders struct {
+	providers.ProviderController
+}
+
+func (renderFakeProviders) GraphitiClient() *graphiti.Client { return nil }
+
+func TestPrompter_RenderAgentPrompt_RendersThePentesterPair(t *testing.T) {
+	q := &renderFakeQuerier{
+		flow: database.Flow{ID: 7, UserID: 42, Language: "English"},
+		cnt:  database.Container{Image: "vxcontrol/kali-linux", Name: "worker-7"},
+	}
+	runner := durableRunner{fc: &flowController{db: q, provs: renderFakeProviders{}, cfg: &config.Config{}}}
+
+	res, err := runner.RenderAgentPrompt(context.Background(), temporal.PromptRenderRequest{
+		FlowID: 7, AgentType: temporal.AgentTypePentester, Input: "scan https://target.test",
+	})
+
+	require.NoError(t, err)
+	assert.Contains(t, res.Instruction, "hack_result")
+	assert.Contains(t, res.Instruction, "terminal")
+	assert.Contains(t, res.Instruction, "English")
+	assert.Contains(t, res.Question, "scan https://target.test")
+}
+
+func TestPrompter_RenderAgentPrompt_RejectsUnknownAgentType(t *testing.T) {
+	runner := durableRunner{fc: &flowController{}}
+
+	_, err := runner.RenderAgentPrompt(context.Background(), temporal.PromptRenderRequest{
+		FlowID: 7, AgentType: "coder", Input: "x",
+	})
+
+	assert.ErrorContains(t, err, `unsupported agent type "coder"`)
 }

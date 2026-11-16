@@ -93,12 +93,19 @@ func sameRepository(image, allowed string) bool {
 }
 
 func (fp *flowProvider) isPentestImage() bool {
+	return IsPentestImage(fp.cfg, fp.image)
+}
+
+// IsPentestImage reports whether image is the configured pentest image; it is
+// a package function so the prompt render activity can classify a flow's
+// container without a provider object.
+func IsPentestImage(cfg *config.Config, image string) bool {
 	pentest := pentestDockerImage
-	if fp.cfg != nil {
-		if configured := normalizeImage(fp.cfg.DockerDefaultImageForPentest); configured != "" {
+	if cfg != nil {
+		if configured := normalizeImage(cfg.DockerDefaultImageForPentest); configured != "" {
 			pentest = configured
 		}
 	}
 
-	return strings.HasPrefix(normalizeImage(fp.image), pentest)
+	return strings.HasPrefix(normalizeImage(image), pentest)
 }
