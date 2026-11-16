@@ -21,6 +21,14 @@ const (
 	toolHeartbeatTimeout  = 30 * time.Second
 )
 
+// Terminal timeout bounds, kept verbatim from pkg/tools/terminal.go: an
+// explicit timeout earns the extra grace on top, and anything non-positive or
+// past the bound lands on the configured default plus the same grace.
+const (
+	maxExplicitExecCommandTimeout = 3 * time.Hour
+	defaultExtraExecTimeout       = 5 * time.Second
+)
+
 // Activities are the worker-side implementations behind the durable tools;
 // every method executes inside one sandboxed activity attempt.
 type Activities struct {
@@ -28,6 +36,10 @@ type Activities struct {
 	payload    PayloadStore
 	threshold  int
 	defTimeout time.Duration
+	// FlowBound wraps terminal argv in docker.FlowCommand so the flow's
+	// stop-command sweep can kill what this workflow started; unset keeps
+	// every command unowned via docker.SandboxCommand.
+	FlowBound bool
 }
 
 func NewActivities(sandbox Sandbox, payload PayloadStore, threshold int, defTimeout time.Duration) *Activities {
@@ -47,18 +59,90 @@ func (a *Activities) Register(r interface {
 	RegisterActivityWithOptions(any, activity.RegisterOptions)
 }) {
 	r.RegisterActivityWithOptions(a.TerminalExec, activity.RegisterOptions{Name: TerminalToolName})
+	r.RegisterActivityWithOptions(a.FileExec, activity.RegisterOptions{Name: FileToolName})
 	r.RegisterActivityWithOptions(a.NucleiScan, activity.RegisterOptions{Name: NucleiToolName})
 	r.RegisterActivityWithOptions(a.HttpxProbe, activity.RegisterOptions{Name: HttpxToolName})
 }
 
 func (a *Activities) TerminalExec(ctx context.Context, in TerminalExecInput) (ToolResult, error) {
-	if strings.TrimSpace(in.Command) == "" {
+	if strings.TrimSpace(in.Input) == "" {
 		return ToolResult{}, nonRetryable("terminal command is required")
 	}
-	return a.exec(ctx, []string{"sh", "-c", in.Command}, ExecOptions{
+	// Production normalises twice — once in the handler, once in the executor
+	// — because the executor is also a barrier target for tools that skip the
+	// handler. Here the path is terminal-only, but the same two steps keep the
+	// arithmetic an exact copy.
+	timeout := normalizeExecTimeout(time.Duration(in.Timeout)*time.Second, a.defTimeout)
+	if timeout > 0 {
+		timeout += defaultExtraExecTimeout
+	}
+	timeout = normalizeExecTimeout(timeout, a.defTimeout)
+
+	argv := sandboxCommand(in.Input)
+	if a.FlowBound {
+		argv = flowCommand(in.Input)
+	}
+	res, err := a.execSandboxed(ctx, argv, ExecOptions{
 		Cwd:     in.Cwd,
-		Timeout: boundedTimeout(in.TimeoutSeconds, a.defTimeout),
+		Timeout: timeout,
+		Detach:  in.Detach,
 	})
+	if err != nil {
+		return ToolResult{}, err
+	}
+	return a.terminalResult(ctx, res, timeout), nil
+}
+
+// terminalResult applies the production formatting contract: a started
+// detached command gets the "still running" text, a timed-out command the
+// error with the detach/timeout HINT (returned whole — capping it could cut
+// the HINT off the tail), and a finished command the output-plus-exit-code
+// text capped like any oversized result.
+func (a *Activities) terminalResult(ctx context.Context, res ExecResult, timeout time.Duration) ToolResult {
+	if res.StillRunning {
+		return ToolResult{Output: fmt.Sprintf(
+			"Command started in background with timeout %s (still running)", timeout)}
+	}
+	if res.TimedOut {
+		return ToolResult{Output: commandTimeoutText(timeout, res.Output), TimedOut: true}
+	}
+	out := ToolResult{
+		Output:    execOutputString(res),
+		ExitCode:  res.ExitCode,
+		Truncated: res.Truncated,
+	}
+	display, uri, capped := a.capOutput(ctx, out.Output)
+	out.Output, out.PayloadURI = display, uri
+	out.Truncated = out.Truncated || capped
+	return out
+}
+
+// commandTimeoutText is the production timeout error verbatim; the trailing
+// HINT is what teaches the model detach or the shell timeout wrapper.
+func commandTimeoutText(timeout time.Duration, partial string) string {
+	suggestedTimeout := max(int(timeout.Seconds())-10, 10)
+	return fmt.Sprintf(
+		"command execution timeout (%v). Partial output: %s. "+
+			"HINT: If this is an interactive command (shell/REPL/listener), use detach=true. "+
+			"For long batch commands, wrap with shell timeout utility: 'timeout %d <command>' to ensure clean completion",
+		context.DeadlineExceeded,
+		truncateString(partial, resultSizeLimit),
+		suggestedTimeout,
+	)
+}
+
+// normalizeExecTimeout replicates terminal.normalizeExecTimeout: the accepted
+// bound is the configured default plus its grace, so only a requested timeout
+// inside (0, bound] survives; the configured default itself caps at 3h.
+func normalizeExecTimeout(timeout, defTimeout time.Duration) time.Duration {
+	if defTimeout <= 0 || defTimeout > maxExplicitExecCommandTimeout {
+		defTimeout = maxExplicitExecCommandTimeout
+	}
+	bound := defTimeout + defaultExtraExecTimeout
+	if timeout > 0 && timeout <= bound {
+		return timeout
+	}
+	return bound
 }
 
 func (a *Activities) NucleiScan(ctx context.Context, in NucleiScanInput) (ToolResult, error) {
@@ -95,53 +179,59 @@ func (a *Activities) HttpxProbe(ctx context.Context, in HttpxProbeInput) (ToolRe
 	return a.exec(ctx, argv, ExecOptions{Timeout: a.defTimeout})
 }
 
-// exec is the shared attempt tail every tool takes: heartbeat for the
-// activity's whole duration, the sandboxed call, then output capping. The exec
-// timeout is clamped to the remaining activity budget — a command that would
-// outlive StartToClose gets its graceful TimedOut result instead of being torn
-// down mid-write and retried into the same wall.
-func (a *Activities) exec(ctx context.Context, argv []string, opts ExecOptions) (ToolResult, error) {
+// execSandboxed is the shared attempt tail every tool takes: heartbeat for
+// the activity's whole duration, then the sandboxed call. The exec timeout is
+// clamped to the remaining activity budget — a command that would outlive
+// StartToClose gets its graceful TimedOut result instead of being torn down
+// mid-write and retried into the same wall. Detached commands are exempt:
+// their point is to outlive the call that started them.
+func (a *Activities) execSandboxed(ctx context.Context, argv []string, opts ExecOptions) (ExecResult, error) {
 	defer startHeartbeat(ctx)()
-	if activity.IsActivity(ctx) {
+	if activity.IsActivity(ctx) && !opts.Detach {
 		if d := activity.GetInfo(ctx).Deadline; !d.IsZero() {
 			if remaining := time.Until(d) - 2*toolHeartbeatInterval; opts.Timeout <= 0 || remaining < opts.Timeout {
 				opts.Timeout = remaining
 			}
 		}
 	}
-	res, err := a.sandbox.Exec(ctx, argv, opts)
+	return a.sandbox.Exec(ctx, argv, opts)
+}
+
+// exec is the generic tool tail: sandboxed call plus the unformatted output
+// cap (nuclei/httpx keep their raw-output result, as before).
+func (a *Activities) exec(ctx context.Context, argv []string, opts ExecOptions) (ToolResult, error) {
+	res, err := a.execSandboxed(ctx, argv, opts)
 	if err != nil {
 		return ToolResult{}, err
 	}
-	return a.finish(ctx, res), nil
-}
-
-// finish caps what the model sees: output over the threshold is handed to the
-// payload store when one is configured, otherwise hard-truncated.
-func (a *Activities) finish(ctx context.Context, res ExecResult) ToolResult {
 	out := ToolResult{
-		Output:    res.Output,
 		ExitCode:  res.ExitCode,
 		TimedOut:  res.TimedOut,
 		Truncated: res.Truncated,
 	}
-	if len(out.Output) <= a.threshold {
-		return out
+	out.Output, out.PayloadURI, out.Truncated = a.capOutput(ctx, res.Output)
+	out.Truncated = out.Truncated || res.Truncated
+	return out, nil
+}
+
+// capOutput caps what the model sees: output over the threshold is handed to
+// the payload store when one is configured, otherwise hard-truncated.
+func (a *Activities) capOutput(ctx context.Context, full string) (display, uri string, capped bool) {
+	if len(full) <= a.threshold {
+		return full, "", false
 	}
-	out.Truncated = true
-	out.Output = strings.Clone(out.Output[:a.threshold])
+	display = strings.Clone(full[:a.threshold])
 	if a.payload == nil {
-		return out
+		return display, "", true
 	}
-	uri, err := a.payload.Put(ctx, payloadKey(ctx), []byte(res.Output))
+	u, err := a.payload.Put(ctx, payloadKey(ctx), []byte(full))
 	if err != nil {
 		if activity.IsActivity(ctx) {
 			activity.GetLogger(ctx).Warn("payload offload failed; truncating", "error", err)
 		}
-		return out
+		return display, "", true
 	}
-	out.PayloadURI = uri
-	return out
+	return display, u, true
 }
 
 // Outside an activity a fresh key keeps every oversized result distinct
@@ -185,15 +275,6 @@ func startHeartbeat(ctx context.Context) func() {
 		}
 	}()
 	return func() { once.Do(func() { close(done); <-stopped }) }
-}
-
-// Compare before multiplying: a model-supplied count past MaxInt64/time.Second
-// would wrap the duration negative and silently disable the exec timeout.
-func boundedTimeout(seconds int, fallback time.Duration) time.Duration {
-	if seconds > 0 && time.Duration(seconds) <= fallback/time.Second {
-		return time.Duration(seconds) * time.Second
-	}
-	return fallback
 }
 
 func validateTarget(target string) error {

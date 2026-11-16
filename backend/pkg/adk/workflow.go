@@ -18,13 +18,20 @@ type PentestRequest struct {
 	Model     string `json:"model,omitempty"`
 	UserID    string `json:"user_id,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
+	// Instruction replaces the pentester's system prompt; Question replaces the
+	// user message the runner opens with (Task is the fallback). Both exist so
+	// the production prompt port can inject its rendered template and
+	// per-request text without going through Task.
+	Instruction string `json:"instruction,omitempty"`
+	Question    string `json:"question,omitempty"`
 	// ToolTimeoutSeconds overrides the activity deadline for each tool call.
 	ToolTimeoutSeconds int `json:"tool_timeout_seconds,omitempty"`
 }
 
 type PentestResult struct {
-	Answer     string `json:"answer"`
-	EventCount int    `json:"event_count"`
+	Answer     string      `json:"answer"`
+	HackResult *HackResult `json:"hack_result,omitempty"`
+	EventCount int         `json:"event_count"`
 }
 
 // modelActivityOptions bounds InvokeModel the way tools are bounded: a
@@ -59,7 +66,7 @@ func PentesterWorkflow(ctx workflow.Context, req PentestRequest) (PentestResult,
 
 	modelName := cmp.Or(req.Model, DefaultModelName)
 	pentester, err := NewPentesterAgent(googleadk.NewModel(modelName,
-		googleadk.WithModelActivityOptions(modelActivityOptions)), tools, nil)
+		googleadk.WithModelActivityOptions(modelActivityOptions)), tools, req.Instruction, nil)
 	if err != nil {
 		return PentestResult{}, err
 	}
@@ -78,7 +85,7 @@ func PentesterWorkflow(ctx workflow.Context, req PentestRequest) (PentestResult,
 	sessionID := cmp.Or(req.SessionID, workflow.GetInfo(ctx).WorkflowExecution.ID)
 
 	adkCtx := googleadk.NewContext(ctx)
-	msg := genai.NewContentFromText(req.Task, genai.RoleUser)
+	msg := genai.NewContentFromText(cmp.Or(req.Question, req.Task), genai.RoleUser)
 
 	var res PentestResult
 	for {
@@ -100,6 +107,10 @@ func PentesterWorkflow(ctx workflow.Context, req PentestRequest) (PentestResult,
 					res.Answer = p.Text
 				}
 			}
+		}
+
+		if hr := extractHackResult(events); hr != nil {
+			res.HackResult = hr
 		}
 
 		pending := googleadk.PendingConfirmations(events)

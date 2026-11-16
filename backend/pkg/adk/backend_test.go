@@ -35,6 +35,18 @@ func TestLocalSandbox_Exec_PropagatesParentCancel(t *testing.T) {
 	assert.False(t, res.TimedOut, "parent cancellation is not the tool's own timeout")
 }
 
+// Detached means started-not-finished: the call comes back at once with the
+// StillRunning verdict while the command keeps running on its own context.
+func TestLocalSandbox_Exec_DetachReturnsStarted(t *testing.T) {
+	start := time.Now()
+	res, err := LocalSandbox{}.Exec(context.Background(),
+		[]string{"sh", "-c", "sleep 30"}, ExecOptions{Detach: true, Timeout: 500 * time.Millisecond})
+	require.NoError(t, err)
+	assert.True(t, res.StillRunning)
+	assert.Empty(t, res.Output)
+	assert.Less(t, time.Since(start), 5*time.Second, "detach must not wait for the command")
+}
+
 func TestLocalSandbox_Exec_ErrorsOnlyOnSpawnFailure(t *testing.T) {
 	_, err := LocalSandbox{}.Exec(context.Background(), []string{"definitely-not-a-binary-xyz"}, ExecOptions{})
 	require.Error(t, err)

@@ -22,7 +22,8 @@ func TestConfig_LoadConfig_Defaults(t *testing.T) {
 	unsetenv(t,
 		"ADK_BASE_URL", "ADK_MODEL_NAME", "ADK_MODEL_API", "ADK_TASK_QUEUE",
 		"ADK_SANDBOX", "ADK_SANDBOX_CONTAINER", "ADK_PAYLOAD_BUCKET",
-		"ADK_PAYLOAD_PREFIX", "ADK_PAYLOAD_THRESHOLD", "ADK_TOOL_TIMEOUT")
+		"ADK_PAYLOAD_PREFIX", "ADK_PAYLOAD_THRESHOLD", "ADK_TOOL_TIMEOUT",
+		"ADK_FLOW_BOUND")
 	t.Setenv("ADK_API_KEY", "test-key")
 
 	cfg, err := LoadConfig()
@@ -33,6 +34,17 @@ func TestConfig_LoadConfig_Defaults(t *testing.T) {
 	assert.Equal(t, "local", cfg.Sandbox)
 	assert.Equal(t, 16384, cfg.PayloadThreshold)
 	assert.Equal(t, "pentagi-adk", cfg.TaskQueue)
+	assert.False(t, cfg.FlowBound)
+}
+
+func TestConfig_LoadConfig_FlowBoundEnv(t *testing.T) {
+	unsetenv(t, "ADK_FLOW_BOUND")
+	t.Setenv("ADK_API_KEY", "test-key")
+	t.Setenv("ADK_FLOW_BOUND", "true")
+
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	assert.True(t, cfg.FlowBound)
 }
 
 func TestConfig_Validate_RejectsInvalidFields(t *testing.T) {

@@ -3,6 +3,7 @@ package adk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -35,29 +36,155 @@ func (o *optsRecordingSandbox) seen() []ExecOptions {
 	return append([]ExecOptions(nil), o.opts...)
 }
 
-func TestActivities_TerminalExec_ShellWrapsAndBoundsTimeout(t *testing.T) {
+func TestActivities_TerminalExec_WrapsAndExecutes(t *testing.T) {
 	sb := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
 		return ExecResult{Output: "uid=0"}, nil
 	}}
 	rec := &optsRecordingSandbox{inner: sb}
 	acts := NewActivities(rec, nil, 1024, time.Minute)
 
-	res, err := acts.TerminalExec(context.Background(), TerminalExecInput{Command: "id", Cwd: "/work", TimeoutSeconds: 10})
+	res, err := acts.TerminalExec(context.Background(), TerminalExecInput{Input: "id", Cwd: "/work", Timeout: 10})
 	require.NoError(t, err)
-	assert.Equal(t, "uid=0", res.Output)
+	assert.Equal(t, "uid=0\n[exit code: 0]", res.Output)
 
 	calls := sb.calls()
 	require.Len(t, calls, 1)
-	assert.Equal(t, []string{"sh", "-c", "id"}, calls[0])
+	assert.Equal(t, []string{"sh", "-c", sandboxCommandSh, "id"}, calls[0])
 	seen := rec.seen()
 	require.Len(t, seen, 1)
 	assert.Equal(t, "/work", seen[0].Cwd)
-	assert.Equal(t, 10*time.Second, seen[0].Timeout)
+	assert.Equal(t, 15*time.Second, seen[0].Timeout)
+	assert.False(t, seen[0].Detach)
+}
+
+// The production arithmetic: an explicit request inside the bound keeps its
+// seconds plus the 5s grace; anything else lands on the configured default
+// plus the grace, and the default itself is capped at 3h.
+func TestActivities_TerminalExec_NormalizesTimeout(t *testing.T) {
+	cases := []struct {
+		name     string
+		def      time.Duration
+		request  int64
+		wantExec time.Duration
+	}{
+		{"zero falls back", 10 * time.Minute, 0, 605 * time.Second},
+		{"negative falls back", 10 * time.Minute, -30, 605 * time.Second},
+		{"inside bound earns grace", 10 * time.Minute, 10, 15 * time.Second},
+		{"at default earns grace", 10 * time.Minute, 600, 605 * time.Second},
+		{"just past bound clamps", 10 * time.Minute, 606, 605 * time.Second},
+		{"way past bound clamps", 10 * time.Minute, 99999, 605 * time.Second},
+		{"zero default caps at ceiling", 0, 0, 3*time.Hour + 5*time.Second},
+		{"over-ceiling default caps", 4 * time.Hour, 0, 3*time.Hour + 5*time.Second},
+		{"request honoured under ceiling default", 0, 100, 105 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &optsRecordingSandbox{inner: &fakeSandbox{}}
+			acts := NewActivities(rec, nil, 1024, tc.def)
+
+			_, err := acts.TerminalExec(context.Background(), TerminalExecInput{Input: "id", Timeout: tc.request})
+			require.NoError(t, err)
+
+			seen := rec.seen()
+			require.Len(t, seen, 1)
+			assert.Equal(t, tc.wantExec, seen[0].Timeout)
+		})
+	}
+}
+
+func TestActivities_TerminalExec_FlowBoundMarksCommand(t *testing.T) {
+	cases := []struct {
+		name       string
+		flowBound  bool
+		wantScript string
+		wantMarker bool
+	}{
+		{"unowned sandbox command", false, sandboxCommandSh, false},
+		{"flow-owned command", true, markFlowCommandSh, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sb := &fakeSandbox{}
+			acts := NewActivities(sb, nil, 1024, time.Minute)
+			acts.FlowBound = tc.flowBound
+
+			_, err := acts.TerminalExec(context.Background(), TerminalExecInput{Input: "id"})
+			require.NoError(t, err)
+
+			calls := sb.calls()
+			require.Len(t, calls, 1)
+			require.Len(t, calls[0], 4)
+			assert.Equal(t, tc.wantScript, calls[0][2])
+			assert.Equal(t, "id", calls[0][3])
+			assert.Equal(t, tc.wantMarker, strings.Contains(calls[0][2], "oom_score_adj"))
+		})
+	}
+}
+
+func TestActivities_TerminalExec_FormatsResult(t *testing.T) {
+	cases := []struct {
+		name string
+		res  ExecResult
+		want string
+	}{
+		{"output and exit code", ExecResult{Output: "uid=0", ExitCode: 0}, "uid=0\n[exit code: 0]"},
+		{"empty output", ExecResult{ExitCode: 1}, "[no output]\n[exit code: 1]"},
+		{"interrupted with dead container", ExecResult{Output: "x", ExitCode: 137, ContainerStopped: true},
+			"x\n[exit code: 137]\n[interrupted: the sandbox container stopped]"},
+		{"high exit code while container lives", ExecResult{Output: "x", ExitCode: 137},
+			"x\n[exit code: 137]"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sb := &fakeSandbox{next: func(argv []string) (ExecResult, error) { return tc.res, nil }}
+			acts := NewActivities(sb, nil, 1024, time.Minute)
+
+			res, err := acts.TerminalExec(context.Background(), TerminalExecInput{Input: "id"})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, res.Output)
+			assert.Equal(t, tc.res.ExitCode, res.ExitCode)
+		})
+	}
+}
+
+func TestActivities_TerminalExec_DetachReturnsStartedString(t *testing.T) {
+	sb := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
+		return ExecResult{StillRunning: true}, nil
+	}}
+	rec := &optsRecordingSandbox{inner: sb}
+	acts := NewActivities(rec, nil, 1024, 10*time.Minute)
+
+	res, err := acts.TerminalExec(context.Background(), TerminalExecInput{Input: "nc -l 4444", Detach: true, Timeout: 30})
+	require.NoError(t, err)
+	assert.Equal(t, "Command started in background with timeout 35s (still running)", res.Output)
+	assert.False(t, res.TimedOut)
+
+	seen := rec.seen()
+	require.Len(t, seen, 1)
+	assert.True(t, seen[0].Detach)
+}
+
+// The error text is part of the model contract: the trailing HINT is what the
+// model reads to learn detach and the shell timeout wrapper.
+func TestActivities_TerminalExec_TimeoutTextCarriesHint(t *testing.T) {
+	sb := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
+		return ExecResult{TimedOut: true, Output: "partial-bits"}, nil
+	}}
+	acts := NewActivities(sb, nil, 1024, 10*time.Minute)
+
+	res, err := acts.TerminalExec(context.Background(), TerminalExecInput{Input: "nmap -T1 scanme.sh"})
+	require.NoError(t, err)
+	assert.True(t, res.TimedOut)
+	assert.Equal(t, "command execution timeout (context deadline exceeded). "+
+		"Partial output: partial-bits. "+
+		"HINT: If this is an interactive command (shell/REPL/listener), use detach=true. "+
+		"For long batch commands, wrap with shell timeout utility: 'timeout 595 <command>' to ensure clean completion",
+		res.Output)
 }
 
 func TestActivities_TerminalExec_RejectsEmptyCommandNonRetryable(t *testing.T) {
 	acts := NewActivities(&fakeSandbox{}, nil, 1024, time.Minute)
-	_, err := acts.TerminalExec(context.Background(), TerminalExecInput{Command: "   "})
+	_, err := acts.TerminalExec(context.Background(), TerminalExecInput{Input: "   "})
 	require.Error(t, err)
 
 	var appErr *temporal.ApplicationError
@@ -118,7 +245,7 @@ func TestActivities_HttpxProbe_MapsFlags(t *testing.T) {
 	}
 }
 
-func TestActivities_Finish_OffloadsOversizedOutput(t *testing.T) {
+func TestActivities_CapOutput_OffloadsOversizedOutput(t *testing.T) {
 	store := NewMemoryPayloadStore()
 	sb := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
 		return ExecResult{Output: strings.Repeat("x", 5000)}, nil
@@ -127,9 +254,9 @@ func TestActivities_Finish_OffloadsOversizedOutput(t *testing.T) {
 
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestActivityEnvironment()
-	env.RegisterActivityWithOptions(acts.TerminalExec, activity.RegisterOptions{Name: TerminalToolName})
+	env.RegisterActivityWithOptions(acts.NucleiScan, activity.RegisterOptions{Name: NucleiToolName})
 
-	val, err := env.ExecuteActivity(acts.TerminalExec, TerminalExecInput{Command: "big-scan"})
+	val, err := env.ExecuteActivity(acts.NucleiScan, NucleiScanInput{Target: "https://scanme.sh"})
 	require.NoError(t, err)
 
 	var res ToolResult
@@ -144,17 +271,36 @@ func TestActivities_Finish_OffloadsOversizedOutput(t *testing.T) {
 	assert.Len(t, blob, 5000)
 }
 
-func TestActivities_Finish_TruncatesWithoutStore(t *testing.T) {
+func TestActivities_CapOutput_TruncatesWithoutStore(t *testing.T) {
 	sb := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
 		return ExecResult{Output: strings.Repeat("y", 5000)}, nil
 	}}
 	acts := NewActivities(sb, nil, 1024, time.Minute)
 
-	res, err := acts.TerminalExec(context.Background(), TerminalExecInput{Command: "big"})
+	res, err := acts.NucleiScan(context.Background(), NucleiScanInput{Target: "https://scanme.sh"})
 	require.NoError(t, err)
 	assert.True(t, res.Truncated)
 	assert.Empty(t, res.PayloadURI)
 	assert.Len(t, res.Output, 1024)
+}
+
+// The terminal formats its result before the cap sees it: the stored blob is
+// the rendered text, exit-code footer included.
+func TestActivities_TerminalExec_OffloadsFormattedOutput(t *testing.T) {
+	store := NewMemoryPayloadStore()
+	sb := &fakeSandbox{next: func(argv []string) (ExecResult, error) {
+		return ExecResult{Output: strings.Repeat("x", 5000)}, nil
+	}}
+	acts := NewActivities(sb, store, 1024, time.Minute)
+
+	res, err := acts.TerminalExec(context.Background(), TerminalExecInput{Input: "big-scan"})
+	require.NoError(t, err)
+	assert.True(t, res.Truncated)
+	assert.Len(t, res.Output, 1024)
+
+	blob, ok := store.Get(strings.TrimPrefix(res.PayloadURI, "mem://"))
+	require.True(t, ok)
+	assert.Equal(t, fmt.Sprintf("%s\n[exit code: 0]", strings.Repeat("x", 5000)), string(blob))
 }
 
 func TestActivities_Exec_PropagatesSandboxError(t *testing.T) {
@@ -163,6 +309,6 @@ func TestActivities_Exec_PropagatesSandboxError(t *testing.T) {
 	}}
 	acts := NewActivities(sb, nil, 1024, time.Minute)
 
-	_, err := acts.TerminalExec(context.Background(), TerminalExecInput{Command: "id"})
+	_, err := acts.TerminalExec(context.Background(), TerminalExecInput{Input: "id"})
 	assert.ErrorContains(t, err, "container gone")
 }

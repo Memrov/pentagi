@@ -1,6 +1,7 @@
 package adk
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -16,18 +17,34 @@ import (
 	"google.golang.org/genai"
 )
 
-// DirectTools builds the same three tools as in-process function tools, for
-// running the agent without Temporal; tool results are identical in shape, and
-// the timeout must match the durable path or the A/B comparison measures
+// DirectTools builds the same tool set as in-process function tools, for
+// running the agent without Temporal; tool results are identical in shape,
+// and the timeout must match the durable path or the A/B comparison measures
 // different tool budgets.
-func DirectTools(sb Sandbox, payload PayloadStore, threshold int, toolTimeout time.Duration) ([]tool.Tool, error) {
+func DirectTools(sb Sandbox, payload PayloadStore, threshold int, toolTimeout time.Duration, flowBound bool) ([]tool.Tool, error) {
 	acts := NewActivities(sb, payload, threshold, toolTimeout)
+	acts.FlowBound = flowBound
+
+	hack, err := newHackResultTool()
+	if err != nil {
+		return nil, err
+	}
 
 	terminal, err := functiontool.New(functiontool.Config{
 		Name:        TerminalToolName,
 		Description: terminalToolDesc,
 	}, func(ctx agent.Context, in TerminalExecInput) (ToolResult, error) {
 		return acts.TerminalExec(ctx, in)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	file, err := functiontool.New(functiontool.Config{
+		Name:        FileToolName,
+		Description: fileToolDesc,
+	}, func(ctx agent.Context, in FileExecInput) (ToolResult, error) {
+		return acts.FileExec(ctx, in)
 	})
 	if err != nil {
 		return nil, err
@@ -53,7 +70,7 @@ func DirectTools(sb Sandbox, payload PayloadStore, threshold int, toolTimeout ti
 		return nil, err
 	}
 
-	return []tool.Tool{terminal, nuclei, httpx}, nil
+	return []tool.Tool{hack, terminal, file, nuclei, httpx}, nil
 }
 
 // RunDirect executes the pentester agent in-process, no Temporal: the fast path
@@ -73,6 +90,7 @@ func RunDirect(ctx context.Context, cfg *Config, sb Sandbox, payload PayloadStor
 		payload:     payload,
 		threshold:   cfg.PayloadThreshold,
 		toolTimeout: cfg.ToolTimeout(),
+		flowBound:   cfg.FlowBound,
 	})
 }
 
@@ -81,15 +99,18 @@ type directOptions struct {
 	payload     PayloadStore
 	threshold   int
 	toolTimeout time.Duration
+	flowBound   bool
+	instruction string
+	question    string
 	guard       ScopeGuard
 }
 
 func runDirect(ctx context.Context, mdl model.LLM, task string, opts directOptions) (PentestResult, error) {
-	tools, err := DirectTools(opts.sb, opts.payload, opts.threshold, opts.toolTimeout)
+	tools, err := DirectTools(opts.sb, opts.payload, opts.threshold, opts.toolTimeout, opts.flowBound)
 	if err != nil {
 		return PentestResult{}, err
 	}
-	pentester, err := NewPentesterAgent(mdl, tools, opts.guard)
+	pentester, err := NewPentesterAgent(mdl, tools, opts.instruction, opts.guard)
 	if err != nil {
 		return PentestResult{}, err
 	}
@@ -103,8 +124,9 @@ func runDirect(ctx context.Context, mdl model.LLM, task string, opts directOptio
 		return PentestResult{}, err
 	}
 
-	msg := genai.NewContentFromText(task, genai.RoleUser)
+	msg := genai.NewContentFromText(cmp.Or(opts.question, task), genai.RoleUser)
 	var res PentestResult
+	var events []*session.Event
 	for ev, err := range r.Run(ctx, "pentagi", "direct", msg, agent.RunConfig{}) {
 		if err != nil {
 			return res, err
@@ -112,6 +134,7 @@ func runDirect(ctx context.Context, mdl model.LLM, task string, opts directOptio
 		if ev == nil {
 			continue
 		}
+		events = append(events, ev)
 		res.EventCount++
 		if ev.Content == nil {
 			continue
@@ -127,5 +150,6 @@ func runDirect(ctx context.Context, mdl model.LLM, task string, opts directOptio
 			}
 		}
 	}
+	res.HackResult = extractHackResult(events)
 	return res, nil
 }

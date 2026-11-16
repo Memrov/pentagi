@@ -34,6 +34,11 @@ type Config struct {
 	PayloadPrefix    string `env:"ADK_PAYLOAD_PREFIX" envDefault:"adk-payloads"`
 	PayloadThreshold int    `env:"ADK_PAYLOAD_THRESHOLD" envDefault:"16384"`
 
+	// FlowBound marks the worker's terminal commands as owned by its flow — the
+	// production stop sweep kills only commands carrying the mark, so an
+	// unmarked command would survive a flow stop.
+	FlowBound bool `env:"ADK_FLOW_BOUND"`
+
 	ToolTimeoutSeconds int `env:"ADK_TOOL_TIMEOUT" envDefault:"600"`
 }
 
