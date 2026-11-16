@@ -13,14 +13,17 @@ import (
 // WorkerPlugin registers the integration's InvokeModel activity (and the MCP
 // activities) at worker start, with our openai-compatible model behind the
 // activity boundary. The key is checked here rather than in Config.Validate so
-// commands that never build a model ("run", "help") do not require it.
+// commands that never build a model ("run", "help") do not require it — and
+// only when no resolver is wired: a production worker resolves keys per flow,
+// so an empty ADK_API_KEY there only degrades non-flow runs to a provider
+// 401 instead of blocking the whole worker.
 //
 // The plugin's Models map matches by name, and a workflow never sends a model
 // name other than cfg.ModelName or the adviser's marked handle — the real
 // model name comes out of the resolved credentials inside the activity, so
 // every provider-configured model is served by these two registrations.
 func WorkerPlugin(cfg *Config, resolver ProviderResolver) (worker.Plugin, error) {
-	if cfg.APIKey == "" {
+	if cfg.APIKey == "" && resolver == nil {
 		return nil, fmt.Errorf("ADK_API_KEY is required")
 	}
 	factory := ModelFactory(cfg, resolver)
