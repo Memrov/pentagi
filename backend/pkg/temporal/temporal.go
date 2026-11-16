@@ -36,9 +36,14 @@ const (
 	EngineAdk    = "adk"
 )
 
-// AgentTypePentester is the only agent type RenderPromptActivity serves; it
-// maps to the pentester/question_pentester prompt pair.
-const AgentTypePentester = "pentester"
+// Agent type names RenderPromptActivity serves; pentester maps to the
+// pentester/question_pentester pair, adviser to the adviser system prompt
+// (its question template needs per-call args, so only the instruction is
+// rendered ahead of time).
+const (
+	AgentTypePentester = "pentester"
+	AgentTypeAdviser   = "adviser"
+)
 
 var (
 	// ErrFlowClosed is returned by a FlowRunner for a flow that was finished
@@ -110,10 +115,14 @@ type ADKPolicy struct {
 }
 
 // PromptRenderRequest asks the flows worker for an agent's prompt pair.
+// IncludeAdvice tells the pentester render to name the advice tool in the
+// toolset variables, matching the tools the child workflow will register;
+// it is ignored for other agent types.
 type PromptRenderRequest struct {
-	FlowID    int64
-	AgentType string
-	Input     string
+	FlowID        int64
+	AgentType     string
+	Input         string
+	IncludeAdvice bool
 }
 
 type RenderedPrompt struct {

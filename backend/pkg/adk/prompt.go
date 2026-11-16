@@ -32,7 +32,7 @@ var promptToolVars = map[string]string{
 	"graphiti_search":                 "GraphitiSearchToolName",
 	"search":                          "SearchToolName",
 	"coder":                           "CoderToolName",
-	"advice":                          "AdviceToolName",
+	AdviceToolName:                    "AdviceToolName",
 	"memorist":                        "MemoristToolName",
 	"maintenance":                     "MaintenanceToolName",
 	TerminalToolName:                  "TerminalToolName",

@@ -86,11 +86,12 @@ func RunDirect(ctx context.Context, cfg *Config, sb Sandbox, payload PayloadStor
 		return PentestResult{}, fmt.Errorf("failed to build model: %w", err)
 	}
 	return runDirect(ctx, mdl, task, directOptions{
-		sb:          sb,
-		payload:     payload,
-		threshold:   cfg.PayloadThreshold,
-		toolTimeout: cfg.ToolTimeout(),
-		flowBound:   cfg.FlowBound,
+		sb:            sb,
+		payload:       payload,
+		threshold:     cfg.PayloadThreshold,
+		toolTimeout:   cfg.ToolTimeout(),
+		flowBound:     cfg.FlowBound,
+		includeAdvice: true,
 	})
 }
 
@@ -103,6 +104,13 @@ type directOptions struct {
 	instruction string
 	question    string
 	guard       ScopeGuard
+	// includeAdvice adds the adviser delegation tool the same way the
+	// workflow's IncludeAdvice request field does; adviceInstruction is its
+	// system prompt (a rendered template in production wiring, the built-in
+	// default here).
+	includeAdvice     bool
+	adviceInstruction string
+	maxIterations     int
 }
 
 func runDirect(ctx context.Context, mdl model.LLM, task string, opts directOptions) (PentestResult, error) {
@@ -110,37 +118,53 @@ func runDirect(ctx context.Context, mdl model.LLM, task string, opts directOptio
 	if err != nil {
 		return PentestResult{}, err
 	}
-	pentester, err := NewPentesterAgent(mdl, tools, opts.instruction, opts.guard)
-	if err != nil {
-		return PentestResult{}, err
+	if opts.includeAdvice {
+		adviceTool, err := newAdviceTool(mdl, opts.adviceInstruction)
+		if err != nil {
+			return PentestResult{}, err
+		}
+		tools = append(tools, adviceTool)
 	}
-	r, err := runner.New(runner.Config{
-		AppName:           appName,
-		Agent:             pentester,
-		SessionService:    session.InMemoryService(),
-		AutoCreateSession: true,
-	})
-	if err != nil {
-		return PentestResult{}, err
-	}
-
+	// One session service across passes keeps the conversation the same way the
+	// workflow's does: a nudged re-run continues the transcript rather than
+	// starting a fresh one, and guard callbacks rebuild per pass because they
+	// bind at agent construction — matching production's per-chain detectors.
+	svc := session.InMemoryService()
 	msg := genai.NewContentFromText(cmp.Or(opts.question, task), genai.RoleUser)
 	var res PentestResult
-	var events []*session.Event
-	for ev, err := range r.Run(ctx, "pentagi", "direct", msg, agent.RunConfig{}) {
+	attempts := 0
+	for {
+		pentester, err := NewPentesterAgent(mdl, tools, opts.instruction, opts.guard, newRunGuards(opts.maxIterations))
 		if err != nil {
 			return res, err
 		}
-		if ev == nil {
-			continue
+		r, err := runner.New(runner.Config{
+			AppName:           appName,
+			Agent:             pentester,
+			SessionService:    svc,
+			AutoCreateSession: true,
+		})
+		if err != nil {
+			return res, err
 		}
-		events = append(events, ev)
-		res.EventCount++
-		if ev.Content == nil {
-			continue
-		}
-		for _, p := range ev.Content.Parts {
-			if p != nil {
+
+		var events []*session.Event
+		for ev, err := range r.Run(ctx, "pentagi", "direct", msg, agent.RunConfig{MaxLLMCalls: -1}) {
+			if err != nil {
+				return res, err
+			}
+			if ev == nil {
+				continue
+			}
+			events = append(events, ev)
+			res.EventCount++
+			if ev.Content == nil {
+				continue
+			}
+			for _, p := range ev.Content.Parts {
+				if p == nil {
+					continue
+				}
 				if p.Text != "" {
 					res.Answer = p.Text
 				}
@@ -149,7 +173,18 @@ func runDirect(ctx context.Context, mdl model.LLM, task string, opts directOptio
 				}
 			}
 		}
+		if hr := extractHackResult(events); hr != nil {
+			res.HackResult = hr
+			return res, nil
+		}
+		attempts++
+		if attempts >= maxBarrierRuns {
+			res.HackResult = &HackResult{
+				Success: false,
+				Result:  fmt.Sprintf("agent ended without hack_result after %d turns", attempts),
+			}
+			return res, nil
+		}
+		msg = genai.NewContentFromText(missingBarrierNudge, genai.RoleUser)
 	}
-	res.HackResult = extractHackResult(events)
-	return res, nil
 }

@@ -261,6 +261,8 @@ func TestWorkflow_FlowWorkflow_AdkEngineDispatchesInputsToChildWorkflows(t *test
 		FlowID:             7,
 		EmitEvents:         true,
 		EmitTaskQueue:      "default-test-taskqueue",
+		IncludeAdvice:      true,
+		AdviceInstruction:  "rendered instruction",
 	}, run.req)
 	assert.Equal(t, []string{"running", "waiting"}, emits.statuses(),
 		"the parent brackets the child run with the flow's status")

@@ -17,7 +17,8 @@ Work the task you are given and only that task.
 
 Tools: terminal runs shell commands in a sandbox, file reads and writes files
 under the sandbox, nuclei_scan runs template scans against one URL, httpx_probe
-fetches HTTP metadata for one URL.
+fetches HTTP metadata for one URL, and advice asks a senior mentor when you are
+stuck or need deeper analysis.
 Prefer targeted probes over broad scans, and say briefly what each action is
 for before you take it.
 
@@ -34,7 +35,14 @@ type ScopeGuard func(ctx agent.Context, t tool.Tool, args map[string]any) (map[s
 // Instruction field: llmagent expands {name} placeholders in that field
 // against session state, and a rendered production prompt carries literal
 // {target_ip}-style markers that must reach the model untouched.
-func NewPentesterAgent(mdl model.LLM, tools []tool.Tool, instruction string, guard ScopeGuard) (agent.Agent, error) {
+//
+// guards carries the per-run guardrails (repeat detection, iteration cap);
+// nil builds an unguarded agent. The repeat check runs before the scope
+// guard, matching production where detection precedes execution. ADK turns
+// function-tool argument failures into {"error": ...} payloads the model
+// reads on the next turn, so production's tool_call_fixer chain needs no
+// equivalent here.
+func NewPentesterAgent(mdl model.LLM, tools []tool.Tool, instruction string, guard ScopeGuard, guards *runGuards) (agent.Agent, error) {
 	instruction = cmp.Or(instruction, pentesterInstruction)
 	cfg := llmagent.Config{
 		Name:        "pentester",
@@ -45,8 +53,13 @@ func NewPentesterAgent(mdl model.LLM, tools []tool.Tool, instruction string, gua
 		},
 		Tools: tools,
 	}
+	if guards != nil {
+		cfg.BeforeModelCallbacks = []llmagent.BeforeModelCallback{guards.beforeModel}
+		cfg.BeforeToolCallbacks = []llmagent.BeforeToolCallback{guards.beforeTool}
+		cfg.AfterToolCallbacks = []llmagent.AfterToolCallback{guards.afterTool}
+	}
 	if guard != nil {
-		cfg.BeforeToolCallbacks = []llmagent.BeforeToolCallback{llmagent.BeforeToolCallback(guard)}
+		cfg.BeforeToolCallbacks = append(cfg.BeforeToolCallbacks, llmagent.BeforeToolCallback(guard))
 	}
 	return llmagent.New(cfg)
 }

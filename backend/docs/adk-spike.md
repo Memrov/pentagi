@@ -1,6 +1,6 @@
 # ADK Go spike: durable pentester agent
 
-`pkg/adk` evaluates replacing the langchaingo agent loop with Google ADK Go 2.0 while keeping Temporal as the only durability and orchestration layer. Phase 2 wires it into production behind a per-flow flag: a flow whose `engine` column reads `adk` runs each input as a child `pentagi.adk.PentesterWorkflow` under `pentagi.FlowWorkflow`, while `legacy` flows — the default and every pre-migration row — take the unchanged `pentagi.ProcessFlowInput` path. The `cmd/adkpentest` CLI remains the standalone exercise path.
+`pkg/adk` evaluates replacing the langchaingo agent loop with Google ADK Go 2.0 while keeping Temporal as the only durability and orchestration layer. Phase 2 wires it into production behind a per-flow flag: a flow whose `engine` column reads `adk` runs each input as a child `pentagi.adk.PentesterWorkflow` under `pentagi.FlowWorkflow`, while `legacy` flows — the default and every pre-migration row — take the unchanged `pentagi.ProcessFlowInput` path. Phase 4 adds the production guardrails (repeat detection, iteration cap, barrier recovery), the first delegated sub-agent tool (`advice`), and continue-as-new across workflow history rollover. The `cmd/adkpentest` CLI remains the standalone exercise path.
 
 ## Architecture
 
@@ -30,7 +30,7 @@ Commands run through the production wrappers replicated in `flowtools.go` (the r
 
 ## Human-in-the-loop and scope seam
 
-`PendingConfirmations`/`ConfirmationResponse` drive the durable HITL loop in the workflow: a pass either completes or pauses on an `adk_request_confirmation` call, and the workflow waits on a Temporal signal for the decision, surviving worker restarts. None of the current tools request confirmation — activity-backed tools cannot — so the loop runs exactly one pass today.
+`PendingConfirmations`/`ConfirmationResponse` drive the durable HITL loop in the workflow: a pass either completes or pauses on an `adk_request_confirmation` call, and the workflow waits on a Temporal signal for the decision, surviving worker restarts. None of the current tools request confirmation — activity-backed tools cannot — so today a pass ends either on `hack_result` or on a text answer the workflow nudges back into the agent (see Phase 4).
 
 `ScopeGuard` in `agent.go` is the isolated seam for the authorization checks the production port will wire; it is unset and must default to allowing. The existing prompts and the scope/authorization guards elsewhere are untouched on purpose.
 
@@ -70,6 +70,7 @@ export TEMPORAL_API_KEY=...   # enables TLS + API-key auth
 - The prompt seam: `PentesterPromptVars` keys match the production map, tool-name variables appear only for registered tools, and instruction/question overrides reach the model request in both modes.
 - Tool activities heartbeat every 5 s (with elapsed-time details) against a 30 s `HeartbeatTimeout`, and `InvokeModel` gets the same heartbeat timeout plus a bounded retry via `WithModelActivityOptions`, so a dead worker or wedged provider is detected in tens of seconds instead of waiting out `StartToCloseTimeout`; a live worker-restart run on Temporal Cloud confirmed the retry-onto-new-worker path. The exec timeout is clamped to the activity's remaining deadline (detached commands exempt — their point is to outlive the call), and parent cancellation propagates as `context.Canceled` while the tool's own deadline produces the graceful `timed_out` result. Cancellation also kills the whole process group — locally via `Setpgid`, in Docker via a PID marker file and a cleanup exec.
 - The Phase 3 bridge: scripted runs assert one `EmitFlowEvent` per session event with the translated ops (call start/end pairs, the hack_result `done` row), an emit failure leaves the workflow green, the adapter tests verify toolcall/msglog/termlog/status writes against fake workers including UTF-8 sanitization and start-idempotency, and the termlog seam is proven before-and-after exec through the activity env.
+- The Phase 4 guardrails: the repeat detector's threshold/replay/abort sequence and its reset on changed calls are unit-tested, a reissued `terminal` call aborts the workflow with the non-retryable `RepeatingToolCallAbort` error after exactly two real executions, the iteration cap ends each pass at the boundary and seeds the synthetic failure, a text-only end is nudged `maxBarrierRuns` times then reported as a failed `HackResult`, and the seeded `BarrierRetries` count proves retries survive continue-as-new. `advice` is proven end to end — the parent's call runs the adviser on the same `InvokeModel` activity, the rendered mentor instruction and JSON args reach it, and its answer returns to the parent as the tool result before `hack_result` closes the run; the emit bridge records the delegation as one toolcall row pair. Continue-as-new is proven by running each continued request in a fresh test environment and asserting the resumed model request carries the imported transcript, plus a direct `ExportSession`/`ImportSession` round-trip.
 
 ## Production wiring (Phase 2)
 
@@ -106,6 +107,22 @@ Start/end correlation is `callID → {toolcall id, msglog id}` in adapter memory
 
 Terminal output reaches the termlog on a second seam: `Activities.TermLogFor` resolves the same per-flow sink by the activity's workflow id (nil resolver → the CLI path stays quiet), and `TerminalExec` writes styled `stdin` before exec and `stdout` after, matching the production `/work $ cmd` framing and green-output styling. The sink is called directly — activities cannot schedule activities — and its failures downgrade to warnings, never a failed command.
 
+## Guardrails, delegation and rollover (Phase 4)
+
+Phase 4 closes the loop-safety gap between the spike and `performAgentChain`, adds the first sub-agent delegation, and survives Temporal history rollover.
+
+| Production behavior | ADK equivalent | Where |
+| --- | --- | --- |
+| `RepeatingToolCallThreshold = 3`, soft detections at calls 3–6 replaying the previous answer, abort at 7 with `maxSoftDetectionsBeforeAbort` | `repeatDetector` in a `BeforeToolCallback` — identical normalized call #3+ returns the cached result plus a `repeat_notice`; call #7 sets a non-retryable `RepeatingToolCallAbort` application error that `BeforeModelCallback` propagates out of the run | `guards.go` |
+| Comparison strips the volatile `message` arg and canonicalizes argument ordering | `callKey` drops `message` and marshals the rest (Go's `json.Marshal` sorts map keys) | `guards.go` |
+| Detector resets when the tool or normalized args change; per-chain detector | `lastKey`/`consecutive` reset per change; `newRunGuards` is rebuilt per `runner.Run` pass because callbacks bind at agent construction | `guards.go`, `workflow.go` |
+| `maxGeneralAgentChainIterations = 100` | `runGuards.beforeModel` counts model calls per pass (`PentestRequest.MaxIterations`, default 100); past the cap it answers for the model with an "Iteration limit" text, ending the pass without another activity | `guards.go` |
+| Reflector decides whether a chain that ended without result gets rerun (≤ `maxReflectorCallsPerChain`) | The workflow nudges a barrier-less pass with a `hack_result` instruction; after `maxBarrierRuns` (3) passes it returns a synthetic `HackResult{Success:false}` — a text-only answer can no longer pass for success | `workflow.go`, `direct.go` |
+| `advice` delegates to a mentor chain | `agenttool.New(adviser)` wraps an `llmagent` adviser; `SkipSummarization:false` keeps it an ordinary tool so the parent continues to `hack_result`. The input schema mirrors `tools.AskAdvice` (`question`+`message` required, `code`/`output` optional); `pentagi.RenderAgentPrompt` renders `adviser.tmpl` worker-side under `AgentTypeAdviser`, and the nested run rides the same `InvokeModel` activity | `advice.go`, `prompter.go` |
+| Long conversations must not blow up workflow history | On `GetContinueAsNewSuggested()` the workflow exports the session with `googleadk.ExportSession` at a function-response boundary (never on the `hack_result` response, which would replay the barrier), carries the snapshot plus `BarrierRetries` in the next run's `PentestRequest`, and `ImportSession` rebuilds it before `runner.Run` resumes with no new user message | `workflow.go` |
+
+Deliberate simplifications against production: the iteration cap is per pass rather than absolute across reflector reruns (each ADK invocation is one chain, matching production's per-chain counters); the missing-barrier nudge is a fixed instruction, not the production reflector's prompt-driven verdict; `advice` skips the enricher sub-agent that rewrites the question in production, which needs the unported search/memory tools; and a repeated-call replay returns the cached result plus a notice field rather than production's exact refusal text.
+
 ## Open gaps for the port
 
 Phase 1 closed: the production `terminal`/`file`/`hack_result` tool surface with verbatim schemas and descriptions, terminal timeout/detach/result parity, the `hack_result` loop barrier in both modes, flow-bound command marking, and the rendered-prompt injection seam.
@@ -114,12 +131,14 @@ Phase 2 closed: the per-flow engine flag end to end (migration, `FLOW_ENGINE`, r
 
 Phase 3 closed: the `pentagi.adk.EmitFlowEvent` activity on the flows queue, the `session.Event → FlowEvent` translation with toolcall/msglog/flow-status rows through the existing workers, the terminal `TermLogFor` sink seam, and the running/waiting status bracket the parent emits around each child.
 
+Phase 4 closed: the repeat-call detector with replay and non-retryable abort, the per-pass iteration cap, workflow-level missing-barrier nudges with the reflector budget and synthetic failure, the `advice` sub-agent tool via `agenttool` with the rendered adviser prompt, and continue-as-new over an exported/imported ADK session snapshot.
+
 Remaining:
 
-- Sub-agent tools (`pentester`, `coder`, `searcher`, `advice`, `memorist`, `maintenance`, `search`/`web_search`, guide stores, `graphiti_search`) — `PentesterPromptVars` already maps their variable names; the activities and handlers are not ported.
-- agentlog and searchlog rows: the bridge writes msglogs, toolcalls and termlogs only — the `agentlogs`/`searchlogs` feeds production fills for sub-agent turns and search results have no ADK source events yet (Phase 4, with the sub-agent tools).
+- Sub-agent tools (`pentester`, `coder`, `searcher`, `memorist`, `maintenance`, `search`/`web_search`, guide stores, `graphiti_search`) — `PentesterPromptVars` already maps their variable names; `advice` is the pattern they follow. The production adviser also passes through a question-enricher agent, deferred until the memory/search tools exist.
+- agentlog and searchlog rows: the bridge writes msglogs, toolcalls and termlogs only — the `agentlogs`/`searchlogs` feeds production fills for sub-agent turns and search results have no ADK source events yet (nested agent-tool runs emit no parent-session events, so `advice` lands as one toolcall pair like production's tool row).
 - `edit_file` diff application (needs container copy plumbing beyond the exec surface) and `ask`/`ask_user` for durable user interaction beyond the confirmation signal.
-- The fixer and reflector chains — the tool-call fixer on malformed calls and the post-run reflector are production prompt-driven flows with no ADK equivalent yet.
+- The fixer and full reflector chains — the tool-call fixer on malformed calls is unnecessary under ADK's `{"error": …}` tool-error contract, and the missing-barrier nudge covers the reflector's retry role; the prompt-driven reflector verdict itself is not ported.
 - Per-user provider resolution: the adk model is one global `ADK_*` config rather than the flow's configured provider and model, so an adk flow ignores its provider row.
 - Session carry-over across continue-as-new (`googleadk.ExportSession`/`ImportSession`) for long tasks — the workflow is single-run today, and `pentagi.hack_result` state is extracted from events rather than read back from an exported session.
 - Fetching `payload_uri` blobs back when the model needs more than the preview (the marker already folds into the toolcall/msglog result text).

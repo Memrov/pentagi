@@ -12,7 +12,7 @@ import (
 func TestNewPentesterAgent_BuildsWithAndWithoutGuard(t *testing.T) {
 	mdl := googleadk.NewModel("fake-model")
 
-	a, err := NewPentesterAgent(mdl, nil, "", nil)
+	a, err := NewPentesterAgent(mdl, nil, "", nil, nil)
 	require.NoError(t, err)
 	require.NotNil(t, a)
 	require.Equal(t, "pentester", a.Name())
@@ -20,7 +20,7 @@ func TestNewPentesterAgent_BuildsWithAndWithoutGuard(t *testing.T) {
 	guard := ScopeGuard(func(ctx agent.Context, tl tool.Tool, args map[string]any) (map[string]any, error) {
 		return nil, nil
 	})
-	a, err = NewPentesterAgent(mdl, nil, "custom instruction", guard)
+	a, err = NewPentesterAgent(mdl, nil, "custom instruction", guard, newRunGuards(0))
 	require.NoError(t, err)
 	require.NotNil(t, a)
 }

@@ -151,6 +151,23 @@ func TestPrompter_RenderAgentPrompt_RendersThePentesterPair(t *testing.T) {
 	assert.Contains(t, res.Question, "scan https://target.test")
 }
 
+func TestPrompter_RenderAgentPrompt_RendersTheAdviserPrompt(t *testing.T) {
+	q := &renderFakeQuerier{
+		flow: database.Flow{ID: 7, UserID: 42, Language: "English"},
+		cnt:  database.Container{Image: "vxcontrol/kali-linux", Name: "worker-7"},
+	}
+	runner := durableRunner{fc: &flowController{db: q, provs: renderFakeProviders{}, cfg: &config.Config{}}}
+
+	res, err := runner.RenderAgentPrompt(context.Background(), temporal.PromptRenderRequest{
+		FlowID: 7, AgentType: temporal.AgentTypeAdviser,
+	})
+
+	require.NoError(t, err)
+	assert.NotEmpty(t, res.Instruction, "the adviser system prompt must render")
+	assert.Contains(t, res.Instruction, "advice")
+	assert.Empty(t, res.Question, "the question template wraps per-call args, not a render-time input")
+}
+
 func TestPrompter_RenderAgentPrompt_RejectsUnknownAgentType(t *testing.T) {
 	runner := durableRunner{fc: &flowController{}}
 

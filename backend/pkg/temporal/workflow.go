@@ -120,6 +120,7 @@ func FlowWorkflow(ctx workflow.Context, params FlowParams) error {
 			FlowID:             params.FlowID,
 			EmitEvents:         true,
 			EmitTaskQueue:      workflow.GetInfo(ctx).TaskQueueName,
+			IncludeAdvice:      true,
 		}
 
 		var rendered RenderedPrompt
@@ -127,12 +128,26 @@ func FlowWorkflow(ctx workflow.Context, params FlowParams) error {
 			return workflow.ExecuteActivity(
 				workflow.WithActivityOptions(c, params.Policy.options()),
 				RenderPromptActivity,
-				PromptRenderRequest{FlowID: params.FlowID, AgentType: AgentTypePentester, Input: input})
+				PromptRenderRequest{FlowID: params.FlowID, AgentType: AgentTypePentester, Input: input, IncludeAdvice: true})
 		}, &rendered) {
 			return
 		}
 		req.Instruction = rendered.Instruction
 		req.Question = rendered.Question
+
+		// The adviser prompt renders beside the pentester's: a failed render
+		// leaves AdviceInstruction empty and the child falls back to its
+		// built-in default, same as the pentester pair.
+		var adviser RenderedPrompt
+		if !await(func(c workflow.Context) workflow.Future {
+			return workflow.ExecuteActivity(
+				workflow.WithActivityOptions(c, params.Policy.options()),
+				RenderPromptActivity,
+				PromptRenderRequest{FlowID: params.FlowID, AgentType: AgentTypeAdviser})
+		}, &adviser) {
+			return
+		}
+		req.AdviceInstruction = adviser.Instruction
 
 		if !await(func(c workflow.Context) workflow.Future { return emitStatus(c, "running") }, nil) {
 			return

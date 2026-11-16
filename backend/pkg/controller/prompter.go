@@ -15,6 +15,7 @@ import (
 	"pentagi/pkg/templates"
 	"pentagi/pkg/templates/validator"
 	"pentagi/pkg/temporal"
+	"pentagi/pkg/tools"
 
 	"github.com/sirupsen/logrus"
 )
@@ -69,15 +70,23 @@ func buildUserPrompter(defaults templates.PromptsMap, userPrompts []database.Pro
 	return templates.NewFlowPrompter(defaults)
 }
 
-// RenderAgentPrompt backs pentagi.RenderAgentPrompt: the pentester pair
-// rendered over the flow's real environment — the durable engine asks for it
-// through an activity because the user prompter and the container row live
+// RenderAgentPrompt backs pentagi.RenderAgentPrompt: agent prompts rendered
+// over the flow's real environment — the durable engine asks for them through
+// an activity because the user prompter and the container row live
 // worker-side. A flow still preparing has no container row; the image facts
 // then stay empty instead of failing the render.
 func (r durableRunner) RenderAgentPrompt(ctx context.Context, req temporal.PromptRenderRequest) (temporal.RenderedPrompt, error) {
-	if req.AgentType != temporal.AgentTypePentester {
+	switch req.AgentType {
+	case temporal.AgentTypePentester:
+		return r.renderPentesterPrompt(ctx, req)
+	case temporal.AgentTypeAdviser:
+		return r.renderAdviserPrompt(ctx, req)
+	default:
 		return temporal.RenderedPrompt{}, fmt.Errorf("unsupported agent type %q", req.AgentType)
 	}
+}
+
+func (r durableRunner) renderPentesterPrompt(ctx context.Context, req temporal.PromptRenderRequest) (temporal.RenderedPrompt, error) {
 	flow, err := r.fc.db.GetFlow(ctx, req.FlowID)
 	if err != nil {
 		return temporal.RenderedPrompt{}, fmt.Errorf("failed to load flow %d: %w", req.FlowID, err)
@@ -93,12 +102,17 @@ func (r durableRunner) RenderAgentPrompt(ctx context.Context, req temporal.Promp
 	}
 	graphiti := r.fc.provs.GraphitiClient()
 
+	toolNames := []string{
+		adk.HackResultToolName, adk.TerminalToolName, adk.FileToolName,
+		adk.NucleiToolName, adk.HttpxToolName,
+	}
+	if req.IncludeAdvice {
+		toolNames = append(toolNames, adk.AdviceToolName)
+	}
+
 	vars := adk.PentesterPromptVars(adk.PentesterPromptInput{
-		Question: req.Input,
-		Tools: []string{
-			adk.HackResultToolName, adk.TerminalToolName, adk.FileToolName,
-			adk.NucleiToolName, adk.HttpxToolName,
-		},
+		Question:                req.Input,
+		Tools:                   toolNames,
 		GraphitiEnabled:         graphiti != nil && graphiti.IsEnabled(),
 		IsDefaultDockerImage:    providers.IsPentestImage(r.fc.cfg, image),
 		DockerImage:             image,
@@ -121,4 +135,50 @@ func (r durableRunner) RenderAgentPrompt(ctx context.Context, req temporal.Promp
 	}
 
 	return temporal.RenderedPrompt{Instruction: instruction, Question: question}, nil
+}
+
+// renderAdviserPrompt renders only the adviser system prompt: the
+// question_adviser template wraps per-call args (question/code/output) that
+// do not exist until the pentester calls advice, and the agenttool forwards
+// those args to the sub-agent directly instead.
+func (r durableRunner) renderAdviserPrompt(ctx context.Context, req temporal.PromptRenderRequest) (temporal.RenderedPrompt, error) {
+	flow, err := r.fc.db.GetFlow(ctx, req.FlowID)
+	if err != nil {
+		return temporal.RenderedPrompt{}, fmt.Errorf("failed to load flow %d: %w", req.FlowID, err)
+	}
+	prompter, err := newUserPrompter(ctx, r.fc.db, flow.UserID)
+	if err != nil {
+		return temporal.RenderedPrompt{}, err
+	}
+
+	var image string
+	if cnt, err := r.fc.db.GetFlowPrimaryContainer(ctx, req.FlowID); err == nil {
+		image = cnt.Image
+	}
+
+	vars := map[string]any{
+		"ExecutionContext":          "",
+		"CurrentTime":               time.Now().Format("2006-01-02 15:04:05"),
+		"FinalyToolName":            tools.FinalyToolName,
+		"PentesterToolName":         tools.PentesterToolName,
+		"HackResultToolName":        tools.HackResultToolName,
+		"CoderToolName":             tools.CoderToolName,
+		"CodeResultToolName":        tools.CodeResultToolName,
+		"MaintenanceToolName":       tools.MaintenanceToolName,
+		"MaintenanceResultToolName": tools.MaintenanceResultToolName,
+		"SearchToolName":            tools.SearchToolName,
+		"SearchResultToolName":      tools.SearchResultToolName,
+		"MemoristToolName":          tools.MemoristToolName,
+		"AdviceToolName":            tools.AdviceToolName,
+		"DockerImage":               image,
+		"Cwd":                       docker.WorkFolderPathInContainer,
+		"ContainerPorts":            providers.ContainerPortsDescription(r.fc.cfg, req.FlowID),
+		"UserFiles":                 flowfiles.FileListingForPrompt(r.fc.cfg.DataDir, uint64(flow.ID)),
+	}
+
+	instruction, err := prompter.RenderTemplate(templates.PromptTypeAdviser, vars)
+	if err != nil {
+		return temporal.RenderedPrompt{}, fmt.Errorf("failed to render adviser prompt: %w", err)
+	}
+	return temporal.RenderedPrompt{Instruction: instruction}, nil
 }

@@ -62,7 +62,11 @@ func TestRunDirect_HackResultEndsLoop(t *testing.T) {
 }
 
 func TestRunDirect_InstructionAndQuestionOverride(t *testing.T) {
-	fm := newRecordingModel("fake-model", googleadk.TextResponse("ok"))
+	fm := newRecordingModel("fake-model",
+		googleadk.TextResponse("ok"),
+		googleadk.FunctionCallResponse("call-2", HackResultToolName, map[string]any{
+			"success": true, "result": "ok", "message": "done"}),
+	)
 
 	_, err := runDirect(context.Background(), fm, "task text", directOptions{
 		sb: &fakeSandbox{}, threshold: 1024, toolTimeout: DefaultToolTimeout,
@@ -71,7 +75,7 @@ func TestRunDirect_InstructionAndQuestionOverride(t *testing.T) {
 	require.NoError(t, err)
 
 	reqs := fm.requests()
-	require.Len(t, reqs, 1)
+	require.Len(t, reqs, 2, "the answer pass, then the nudged hack_result pass")
 	require.NotNil(t, reqs[0].Config)
 	require.NotNil(t, reqs[0].Config.SystemInstruction)
 	assert.True(t, strings.HasPrefix(reqs[0].Config.SystemInstruction.Parts[0].Text, "OVERRIDE INSTRUCTION"),
@@ -105,4 +109,20 @@ func TestRunDirect_ScopeGuardShortCircuitsTool(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "call was blocked", res.Answer)
 	assert.Empty(t, sb.calls(), "the guard must run before the sandbox")
+}
+
+// A model that never calls hack_result gets nudged like the workflow does,
+// and after the budget is spent the result carries the same synthetic
+// failure the workflow writes.
+func TestRunDirect_MissingBarrierYieldsSyntheticFailure(t *testing.T) {
+	fm := newRecordingModel("fake-model", googleadk.TextResponse("no closing call"))
+
+	res, err := runDirect(context.Background(), fm, "scan", directOptions{
+		sb: &fakeSandbox{}, threshold: 1024, toolTimeout: DefaultToolTimeout,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, res.HackResult)
+	assert.False(t, res.HackResult.Success)
+	assert.Contains(t, res.HackResult.Result, "after 3 turns")
+	assert.Len(t, fm.requests(), maxBarrierRuns)
 }

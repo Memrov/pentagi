@@ -15,6 +15,7 @@ const (
 	HackResultToolName = "hack_result"
 	NucleiToolName     = "nuclei_scan"
 	HttpxToolName      = "httpx_probe"
+	AdviceToolName     = "advice"
 
 	appName = "pentagi-adk"
 
